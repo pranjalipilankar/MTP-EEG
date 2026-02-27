@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+env/
+venv/
+
+# Model checkpoints and weights
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pkl
+*.pickle
+
+# Results and metrics
+results_*/
+metrics_*.npy
+*_metrics.npy
+MSE_LOSS/
+topomap_results/
+
+# Logs
+*.log
+out.log
+
+# Data files
+*.npz
+*.mat
+DATA/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Papers
+Papers/
+
+# Specific large files/folders
+LOSS/
+New_DEAP/pretrained_non_diff_mae_*.pt
+New_LocalizeMI/best_stad_localizemi.pt
+trial_mae_Localize-MI/results_128ch/
