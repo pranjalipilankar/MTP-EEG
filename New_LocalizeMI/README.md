@@ -212,3 +212,64 @@ If you use this for research on Localize-MI, cite the original dataset:
 - Consider starting with fewer channels (64→128) if this is too demanding
 - Results may be more variable than DEAP/SEED due to complexity
 - Patience and careful hyperparameter tuning are essential
+```yaml
+# ─────────────────────────────────────────────
+# Model Configuration
+# ─────────────────────────────────────────────
+
+# ── MAE (Masked Autoencoder) ──────────────────
+mae:
+  freeze_until_epoch: 50
+  encoder:
+    num_layers: 24
+    embed_dim: 1024
+    num_heads: 16
+  decoder:
+    num_layers: 8
+    embed_dim: 512
+    num_heads: 16
+  patch_size: 16
+  io:
+    input_shape: [B, 256, 2080]   # (batch, channels, time)
+    latent_shape: [B, 130, 1024]  # (batch, tokens, dim)
+
+# ── Spatio-Temporal Conditioning (STC) ────────
+stc:
+  io:
+    input_shape: [B, 128, 2080]   # LR EEG (batch, channels, time)
+    output: conditioning_tokens_and_pooled_features
+
+  embed_dim: 1024                 # must match mae.encoder.embed_dim
+  patch_size: 32                  # larger patch for HD-EEG complexity
+  num_graph_spectral_harmonics: 8
+
+# ── Multi-Scale Transformer Denoising (MTD) ───
+mtd:
+  num_layers: 8
+  num_heads: 16
+
+  io:
+    input_shape: [B, 130, 1024]   # noisy latent (matches mae latent)
+    output: predicted_noise
+
+  conditioning_source: stc        # receives tokens + pooled features from STC
+```
+
+
+def __init__(self):
+    # MAE
+    self.mae_freeze_until = 50
+    self.mae_enc_layers, self.mae_enc_dim, self.mae_enc_heads = 24, 1024, 16
+    self.mae_dec_layers, self.mae_dec_dim, self.mae_dec_heads = 8, 512, 16
+    self.mae_patch_size = 16
+    self.mae_input_shape = (256, 2080)   # → latent: (130, 1024)
+
+    # STC
+    self.stc_input_shape = (128, 2080)
+    self.stc_embed_dim = 1024            # matches mae_enc_dim
+    self.stc_patch_size = 32
+    self.stc_harmonics = 8
+
+    # MTD
+    self.mtd_layers, self.mtd_heads = 8, 16
+    self.mtd_input_shape = (130, 1024)   # matches mae latent

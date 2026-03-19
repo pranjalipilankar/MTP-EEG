@@ -1,0 +1,29 @@
+🖥️ Device: cuda | Mode: denoise
+📂 Loading sub1.npy  shape=(7, 62, 104000)
+📂 Loading sub10.npy  shape=(7, 62, 104000)
+📂 Loading sub11.npy  shape=(7, 62, 104000)
+📂 Loading sub12.npy  shape=(7, 62, 104000)
+📂 Loading sub13.npy  shape=(7, 62, 104000)
+📂 Loading sub14.npy  shape=(7, 62, 104000)
+📂 Loading sub15.npy  shape=(7, 62, 104000)
+📂 Loading sub16.npy  shape=(7, 62, 104000)
+📂 Loading sub17.npy  shape=(7, 62, 104000)
+📂 Loading sub18.npy  shape=(7, 62, 104000)
+📂 Loading sub19.npy  shape=(7, 62, 104000)
+📂 Loading sub1_session2.npy  shape=(7, 62, 104000)
+📂 Loading sub2.npy  shape=(7, 62, 104000)
+📂 Loading sub20.npy  shape=(7, 62, 104000)
+📂 Loading sub3.npy  shape=(7, 62, 104000)
+📂 Loading sub4.npy  shape=(7, 62, 104000)
+📂 Loading sub5.npy  shape=(7, 62, 104000)
+📂 Loading sub6.npy  shape=(7, 62, 104000)
+📂 Loading sub7.npy  shape=(7, 62, 104000)
+📂 Loading sub8.npy  shape=(7, 62, 104000)
+📂 Loading sub9.npy  shape=(7, 62, 104000)
+✅ Loaded 38220 segments from all subjects.
+✅ Loaded checkpoint 'eeg_conditioned_model_diff_denoise.pt' (epoch=0)
+📊 Test Metrics → MSE=0.862871 | RMSE=0.885834 | MAE=0.669148 | Corr=0.8434 | R2=-0.6150 | SNR=0.74 dB
+✅ Saved metrics → results_test/metrics_denoise.csv
+✅ Saved reconstructed EEG segments
+✅ Saved per-channel CSVs → results_test/channel_samples_denoise
+📊 Saved reconstruction grid

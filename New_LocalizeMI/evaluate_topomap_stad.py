@@ -733,8 +733,8 @@ if __name__ == '__main__':
     os.system('bash fix_cache.sh')
     
     evaluate_topomap_stad(
-        checkpoint_path='best_stad_localizemi.pt',
+        checkpoint_path='/home/ab_students/EEG-MTP/New_LocalizeMI/best_stad_localizemi.pt',
         data_path='/home/ab_students/EEG-MTP/DATA/Localize-MI/derivatives/epochs',
-        output_dir='topomap_results',
+        output_dir='topomap_results2',
         n_samples=5
     )

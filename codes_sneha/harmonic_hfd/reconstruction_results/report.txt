@@ -1,0 +1,16 @@
+STAD EEG Reconstruction Report
+============================================================
+
+Checkpoint: best_stad_DIMENSION_FIXED2.pt
+Epoch: 293
+Val Loss: 0.008424
+DDIM Steps: 50
+Num Samples: 50
+
+Metrics:
+------------------------------------------------------------
+PCC                 : 0.0029
+RMSE                : 1.3003
+SNR                 : -2.2543
+NMSE                : 1.7011
+MAE                 : 1.0183

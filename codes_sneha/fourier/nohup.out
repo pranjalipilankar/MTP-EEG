@@ -1,0 +1,7 @@
+usage: train_cond_transformer.py [-h] [--data_root DATA_ROOT]
+                                 [--mode {denoise,completion}]
+                                 [--epochs EPOCHS] [--batch_size BATCH_SIZE]
+                                 [--lr LR] [--max_lr MAX_LR]
+                                 [--weight_decay WEIGHT_DECAY]
+                                 [--patience PATIENCE]
+train_cond_transformer.py: error: unrecognized arguments: --resume --checkpoint /home/ab_students/EEG-MTP/codes_sneha/fourier/eeg_conditioned_model_diff_denoise.pt

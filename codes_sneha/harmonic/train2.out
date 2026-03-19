@@ -1,0 +1,51 @@
+🖥️  Device: cuda | mode=denoise
+📂 Loading sub1.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub10.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub11.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub12.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub13.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub14.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub15.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub16.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub17.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub18.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub19.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub1_session2.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub2.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+📂 Loading sub20.npy  shape=(7, 62, 104000)
+✂️  Using only last 50% → new shape=(7, 62, 52000)
+✅ Loaded 12740 segments from all subjects.
+Training samples: 11466, Validation: 1274
+🚀 Starting training...
+Epoch 001: TrainLoss=0.986911 | ValLoss_eps=0.199244 | ValReconRMSE=0.406936 | ValMAE=0.321884 | nRMSE(range)=0.074687 | nRMSE(std)=0.411020
+[GPU] allocated=0.09GB reserved=0.29GB
+✅ Saved best model (val_loss=0.199244) → eeg_conditioned_model_diff_denoise.pt
+Epoch 002: TrainLoss=0.631613 | ValLoss_eps=0.342639 | ValReconRMSE=0.535368 | ValMAE=0.410126 | nRMSE(range)=0.097878 | nRMSE(std)=0.538066
+[GPU] allocated=0.09GB reserved=0.19GB
+Epoch 003: TrainLoss=0.515994 | ValLoss_eps=0.412453 | ValReconRMSE=0.594230 | ValMAE=0.459580 | nRMSE(range)=0.109358 | nRMSE(std)=0.601404
+[GPU] allocated=0.09GB reserved=0.29GB
+Epoch 004: TrainLoss=0.436432 | ValLoss_eps=0.440336 | ValReconRMSE=0.611209 | ValMAE=0.472281 | nRMSE(range)=0.112293 | nRMSE(std)=0.617475
+[GPU] allocated=0.09GB reserved=0.18GB
+Epoch 005: TrainLoss=0.374239 | ValLoss_eps=0.485291 | ValReconRMSE=0.643441 | ValMAE=0.497244 | nRMSE(range)=0.118400 | nRMSE(std)=0.651510
+[GPU] allocated=0.09GB reserved=0.29GB
+Epoch 006: TrainLoss=0.334172 | ValLoss_eps=0.541118 | ValReconRMSE=0.683130 | ValMAE=0.527757 | nRMSE(range)=0.125578 | nRMSE(std)=0.690656
+[GPU] allocated=0.09GB reserved=0.19GB
+Epoch 007: TrainLoss=0.312243 | ValLoss_eps=0.537638 | ValReconRMSE=0.677267 | ValMAE=0.522798 | nRMSE(range)=0.124259 | nRMSE(std)=0.683453
+[GPU] allocated=0.09GB reserved=0.29GB
+⏹️ Early stopping at epoch 7
+🎉 Training complete.
+🏆 Best Validation Loss: 0.199244
+📈 Saved training plot → results/training_metrics_denoise.png

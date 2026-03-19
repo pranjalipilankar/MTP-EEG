@@ -1,0 +1,44 @@
+🖥️  Device: cuda | mode=denoise
+📂 Loading sub1.npy  shape=(7, 62, 104000)
+📂 Loading sub10.npy  shape=(7, 62, 104000)
+📂 Loading sub11.npy  shape=(7, 62, 104000)
+📂 Loading sub12.npy  shape=(7, 62, 104000)
+📂 Loading sub13.npy  shape=(7, 62, 104000)
+📂 Loading sub14.npy  shape=(7, 62, 104000)
+📂 Loading sub15.npy  shape=(7, 62, 104000)
+📂 Loading sub16.npy  shape=(7, 62, 104000)
+📂 Loading sub17.npy  shape=(7, 62, 104000)
+📂 Loading sub18.npy  shape=(7, 62, 104000)
+📂 Loading sub19.npy  shape=(7, 62, 104000)
+📂 Loading sub1_session2.npy  shape=(7, 62, 104000)
+📂 Loading sub2.npy  shape=(7, 62, 104000)
+📂 Loading sub20.npy  shape=(7, 62, 104000)
+📂 Loading sub3.npy  shape=(7, 62, 104000)
+📂 Loading sub4.npy  shape=(7, 62, 104000)
+📂 Loading sub5.npy  shape=(7, 62, 104000)
+📂 Loading sub6.npy  shape=(7, 62, 104000)
+📂 Loading sub7.npy  shape=(7, 62, 104000)
+📂 Loading sub8.npy  shape=(7, 62, 104000)
+📂 Loading sub9.npy  shape=(7, 62, 104000)
+✅ Loaded 38220 segments from all subjects.
+Training samples: 34398, Validation: 3822
+🚀 Starting training...
+Epoch 001: TrainLoss=0.785159 | ValLoss_eps=0.329906 | ValReconRMSE=0.525026 | ValMAE=0.405948 | nRMSE(range)=0.098500 | nRMSE(std)=0.538200
+[GPU] allocated=0.10GB reserved=0.20GB
+✅ Saved best model (val_loss=0.329906) → eeg_conditioned_model_diff_denoise.pt
+Epoch 002: TrainLoss=0.450660 | ValLoss_eps=0.447742 | ValReconRMSE=0.613739 | ValMAE=0.473311 | nRMSE(range)=0.115232 | nRMSE(std)=0.630590
+[GPU] allocated=0.10GB reserved=0.18GB
+Epoch 003: TrainLoss=0.332427 | ValLoss_eps=0.467609 | ValReconRMSE=0.630204 | ValMAE=0.486105 | nRMSE(range)=0.118478 | nRMSE(std)=0.648332
+[GPU] allocated=0.10GB reserved=0.18GB
+Epoch 004: TrainLoss=0.293044 | ValLoss_eps=0.520619 | ValReconRMSE=0.663651 | ValMAE=0.512396 | nRMSE(range)=0.124261 | nRMSE(std)=0.680070
+[GPU] allocated=0.10GB reserved=0.18GB
+Epoch 005: TrainLoss=0.271499 | ValLoss_eps=0.520465 | ValReconRMSE=0.664406 | ValMAE=0.512054 | nRMSE(range)=0.124845 | nRMSE(std)=0.683326
+[GPU] allocated=0.10GB reserved=0.20GB
+Epoch 006: TrainLoss=0.259082 | ValLoss_eps=0.544926 | ValReconRMSE=0.678661 | ValMAE=0.522948 | nRMSE(range)=0.127010 | nRMSE(std)=0.695019
+[GPU] allocated=0.10GB reserved=0.20GB
+Epoch 007: TrainLoss=0.250953 | ValLoss_eps=0.554137 | ValReconRMSE=0.684991 | ValMAE=0.527921 | nRMSE(range)=0.128425 | nRMSE(std)=0.702715
+[GPU] allocated=0.10GB reserved=0.18GB
+⏹️ Early stopping at epoch 7
+🎉 Training complete.
+🏆 Best Validation Loss: 0.329906
+📈 Saved training plot → results/training_metrics_denoise.png
