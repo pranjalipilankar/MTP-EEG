@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from mae_for_eeg import MAEforEEG
 from stad_model_CORRECT import STADModel
@@ -156,6 +157,37 @@ def build_mae_encoder(mae_checkpoint_path, device):
     return mae_model
 
 
+def save_eeg_signal_figure(pred_sr, target_sr, lr_eeg, out_path, sample_idx, channels_to_plot):
+    """Save overlay plots of predicted vs target EEG signals for selected channels."""
+    pred_np = pred_sr[sample_idx].detach().cpu().numpy()
+    target_np = target_sr[sample_idx].detach().cpu().numpy()
+    lr_np = lr_eeg[sample_idx].detach().cpu().numpy()
+
+    n_rows = len(channels_to_plot)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(14, 2.6 * n_rows), sharex=True)
+    if n_rows == 1:
+        axes = [axes]
+
+    for row, ch_idx in enumerate(channels_to_plot):
+        ax = axes[row]
+        ax.plot(target_np[ch_idx], color='black', linewidth=1.0, label='Target SR (62ch)')
+        ax.plot(pred_np[ch_idx], color='tab:blue', linewidth=0.9, alpha=0.85, label='Predicted SR')
+
+        if ch_idx < lr_np.shape[0]:
+            ax.plot(lr_np[ch_idx], color='tab:orange', linewidth=0.8, alpha=0.65, label='LR input (if mapped)')
+
+        ax.set_ylabel(f"Ch {ch_idx}")
+        ax.grid(alpha=0.25)
+        if row == 0:
+            ax.legend(loc='upper right', ncol=3, fontsize=8)
+
+    axes[-1].set_xlabel('Time samples')
+    fig.suptitle(f'EEG Signals: sample {sample_idx}', fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
 def evaluate(args):
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -201,6 +233,14 @@ def evaluate(args):
 
     model.eval()
 
+    fig_dir = None
+    saved_figures = 0
+    if args.save_fig_dir:
+        fig_dir = Path(args.save_fig_dir)
+        fig_dir.mkdir(parents=True, exist_ok=True)
+
+    channels_to_plot = [0, 7, 15, 23, 31, 45, 61]
+
     diff_losses = []
     sr_losses = []
     pcc_scores = []
@@ -228,6 +268,22 @@ def evaluate(args):
             nmse_scores.append(metrics['nmse'])
             snr_scores.append(metrics['snr'])
 
+            if fig_dir is not None and saved_figures < args.num_fig_samples:
+                batch_size = pred_sr.shape[0]
+                for b in range(batch_size):
+                    if saved_figures >= args.num_fig_samples:
+                        break
+                    fig_path = fig_dir / f"eeg_signal_sample_{saved_figures:03d}.png"
+                    save_eeg_signal_figure(
+                        pred_sr=pred_sr,
+                        target_sr=sr_eeg,
+                        lr_eeg=lr_eeg,
+                        out_path=fig_path,
+                        sample_idx=b,
+                        channels_to_plot=channels_to_plot,
+                    )
+                    saved_figures += 1
+
             if args.max_batches > 0 and (i + 1) >= args.max_batches:
                 break
 
@@ -246,6 +302,8 @@ def evaluate(args):
     print(f"PCC: {mean_pcc:.4f}")
     print(f"NMSE: {mean_nmse:.4f}")
     print(f"SNR: {mean_snr:.2f} dB")
+    if fig_dir is not None:
+        print(f"Saved EEG figures: {saved_figures} -> {fig_dir}")
 
 
 if __name__ == '__main__':
@@ -274,5 +332,9 @@ if __name__ == '__main__':
                         help='Sampling steps when --use_sampling is enabled')
     parser.add_argument('--max_batches', type=int, default=0,
                         help='If >0, stop early after this many batches (debug)')
+    parser.add_argument('--save_fig_dir', type=str, default='test_figures_preprocessed',
+                        help='Directory to save EEG signal figures (empty to disable)')
+    parser.add_argument('--num_fig_samples', type=int, default=3,
+                        help='How many samples to plot as EEG figures')
 
     evaluate(parser.parse_args())

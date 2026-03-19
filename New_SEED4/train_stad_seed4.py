@@ -98,6 +98,32 @@ class SEED4STADDataset(Dataset):
         else:
             self._load_processed_data(data_path, subjects)
 
+    def _load_processed_data(self, data_path, subjects):
+        """Load processed data from session/subject_date/X_prc1.npy structure."""
+        all_windows = []
+        for subject_id in subjects:
+            for session in ['1', '2', '3']:
+                session_path = data_path / session
+                if not session_path.exists():
+                    continue
+
+                subject_folders = list(session_path.glob(f'{subject_id}_*'))
+                for folder in subject_folders:
+                    x_file = folder / 'X_prc1.npy'
+                    if x_file.exists():
+                        data = np.load(x_file)
+                        all_windows.append(data)
+
+        if len(all_windows) == 0:
+            raise ValueError(f"No processed data found for subjects {subjects}")
+
+        all_windows = np.concatenate(all_windows, axis=0)
+        print(f"Loaded {len(all_windows)} windows from {len(subjects)} subjects")
+
+        self.sr_samples = all_windows.astype(np.float32)
+        self.hr_samples = self._downsample_channels(all_windows, self.hr_channels, self.hr_indices)
+        self.lr_samples = self._downsample_channels(all_windows, self.lr_channels, self.lr_indices)
+
     def _load_raw_data(self, data_path, subjects):
         """Load raw data directly from the specified folder."""
         all_windows = []
@@ -551,39 +577,10 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
             'lr': float(optimizer.param_groups[0]['lr']),
         })
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_path = output_dir / 'best_stad_model.pth'
-            torch.save(
-                {
-                    'epoch': epoch + 1,
-                    'model_state_dict': stad_model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_total_loss': val_loss,
-                    'val_diff_loss': val_diff,
-                    'val_sr_loss': val_sr,
-                    'val_pcc': mean_pcc,
-                    'val_nmse': mean_nmse,
-                    'val_snr_db': mean_snr,
-                    'train_total_loss': train_loss,
-                    'train_diff_loss': train_diff,
-                    'train_sr_loss': train_sr,
-                    'best_val_loss': best_val_loss,
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict(),
-                },
-                save_path,
-            )
-            print(f"  ✅ Saved best STAD checkpoint: {save_path}")
-
-        latest_path = output_dir / 'latest_stad_model.pth'
-        torch.save(
-            {
-                'epoch': epoch + 1,
+        def _build_ckpt_payload(epoch_idx):
+            payload = {
+                'epoch': epoch_idx + 1,
                 'model_state_dict': stad_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
                 'best_val_loss': best_val_loss,
                 'val_total_loss': val_loss,
                 'val_diff_loss': val_diff,
@@ -594,9 +591,29 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
                 'train_total_loss': train_loss,
                 'train_diff_loss': train_diff,
                 'train_sr_loss': train_sr,
-            },
-            latest_path,
-        )
+            }
+            if args.save_optimizer_state:
+                payload['optimizer_state_dict'] = optimizer.state_dict()
+                payload['scheduler_state_dict'] = scheduler.state_dict()
+                payload['scaler_state_dict'] = scaler.state_dict()
+            return payload
+
+        def _safe_torch_save(payload, path, label):
+            try:
+                torch.save(payload, path)
+                return True
+            except Exception as exc:
+                print(f"  ⚠️  Could not save {label} checkpoint to {path}: {exc}")
+                return False
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_path = output_dir / 'best_stad_model.pth'
+            if _safe_torch_save(_build_ckpt_payload(epoch), save_path, 'best'):
+                print(f"  ✅ Saved best STAD checkpoint: {save_path}")
+
+        latest_path = output_dir / 'latest_stad_model.pth'
+        _safe_torch_save(_build_ckpt_payload(epoch), latest_path, 'latest')
 
     history_path = output_dir / 'training_history.npy'
     np.save(history_path, history, allow_pickle=True)
@@ -736,6 +753,8 @@ def main():
                        help='Path to STAD checkpoint to resume from (e.g., results_stad/latest_stad_model.pth)')
     parser.add_argument('--resume_optimizer', action='store_true',
                        help='Resume optimizer/scheduler/scaler state when loading --resume_stad_checkpoint')
+    parser.add_argument('--save_optimizer_state', action='store_true',
+                       help='Save optimizer/scheduler/scaler states in checkpoints (much larger files)')
     
     args = parser.parse_args()
     
@@ -760,9 +779,9 @@ def main():
     
     # Create datasets
     print("\nCreating datasets...")
-    train_dataset = SEED4STADDataset(args.data_path, splits['train'])
-    val_dataset = SEED4STADDataset(args.data_path, splits['val'])
-    test_dataset = SEED4STADDataset(args.data_path, splits['test'])
+    train_dataset = SEED4STADDataset(args.data_path, splits['train'], raw_data=args.raw_data)
+    val_dataset = SEED4STADDataset(args.data_path, splits['val'], raw_data=args.raw_data)
+    test_dataset = SEED4STADDataset(args.data_path, splits['test'], raw_data=args.raw_data)
     
     # Create dataloaders
     print("\nCreating dataloaders...")
