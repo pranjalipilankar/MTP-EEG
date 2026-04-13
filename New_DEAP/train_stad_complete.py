@@ -10,14 +10,70 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import json
+import sys
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 from scipy.signal import butter, filtfilt
 
-from pretrain_dreamdiff_mae import MAEforEEG
+# Use the exact MAE implementation used in k-fold pretraining for full latent compatibility.
+sys.path.insert(0, '/home/ab_students/EEG-MTP/trial_mae_DEAP')
+from mae_for_eeg import MAEforEEG
 from spatio_temporal_condition import SpatioTemporalConditionModule  
 from mtd_dreamdiff import MultiScaleTransformerDenoisingModule
+
+
+def _resolve_best_kfold_checkpoint(results_dir, preferred_fold=None):
+    """Return checkpoint path and metadata from a DEAP k-fold results directory."""
+    summary_path = os.path.join(results_dir, 'kfold_summary.json')
+    if not os.path.exists(summary_path):
+        raise FileNotFoundError(f"kfold_summary.json not found in {results_dir}")
+
+    with open(summary_path, 'r', encoding='utf-8') as f:
+        summary = json.load(f)
+
+    fold_results = summary.get('fold_results', [])
+    if not fold_results:
+        raise ValueError(f"No fold_results found in {summary_path}")
+
+    if preferred_fold is not None:
+        selected = None
+        for row in fold_results:
+            if int(row['fold']) == int(preferred_fold):
+                selected = row
+                break
+        if selected is None:
+            raise ValueError(f"Requested fold {preferred_fold} not found in {summary_path}")
+    else:
+        selected = max(fold_results, key=lambda x: x.get('best_val_corr', float('-inf')))
+
+    fold = int(selected['fold'])
+    ckpt_path = os.path.join(results_dir, f'fold_{fold}', 'best_model.pth')
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    return ckpt_path, selected
+
+
+def _load_mae_from_kfold_results(mae_module, results_dir, device, preferred_fold=None):
+    """Load MAE weights from best (or chosen) k-fold checkpoint with strict matching."""
+    ckpt_path, selected = _resolve_best_kfold_checkpoint(results_dir, preferred_fold=preferred_fold)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    source_state = ckpt.get('model_state_dict', {})
+
+    source_state = {
+        k: (v.float() if torch.is_floating_point(v) else v)
+        for k, v in source_state.items()
+    }
+    mae_module.load_state_dict(source_state, strict=True)
+    print(
+        f"✅ Loaded MAE from {ckpt_path} | fold={selected['fold']} "
+        f"(val_corr={selected.get('best_val_corr', 0.0):.4f})"
+    )
+    print(f"   Strict load complete with {len(source_state)} tensors.")
+
+    return ckpt.get('config', {}), ckpt_path
 
 def get_beta_schedule(timesteps=1000):
     steps = timesteps + 1
@@ -56,10 +112,10 @@ def reconstruct_eeg_fixed(model, x_lr, diff_params, device, steps=50):
     model.eval()
     with torch.no_grad():
         B = x_lr.shape[0]
-        lr_pos = get_channel_positions(16, device, B)
+        lr_pos = get_channel_positions(model.lr_channels, device, B)
         
-        # Start from noise (B, 100, 256)
-        zt = torch.randn(B, 100, 256, device=device)
+        # Start from noise in latent shape (B, num_patches, latent_dim)
+        zt = torch.randn(B, model.num_patches, model.latent_dim, device=device)
         
         timesteps = torch.linspace(999, 0, steps, dtype=torch.long, device=device)
         
@@ -91,7 +147,7 @@ def reconstruct_eeg_fixed(model, x_lr, diff_params, device, steps=50):
         # Decode
         cls_token = model.mae.cls_token.expand(B, -1, -1)
         zt_with_cls = torch.cat([cls_token, zt], dim=1)
-        pred_patches = model.mae.decode_full(zt_with_cls)
+        pred_patches = model.mae_decode_full(zt_with_cls)
         sr_eeg = model.mae.unpatchify(pred_patches)
         
         return sr_eeg
@@ -152,7 +208,13 @@ class STADDataset(Dataset):
     
     def prepare_segments(self, X, target_channels):
         n_trials, n_channels, _ = X.shape
-        indices = np.linspace(0, n_channels-1, target_channels, dtype=int)
+        if target_channels == n_channels:
+            indices = np.arange(n_channels, dtype=int)
+        elif target_channels == 16 and n_channels >= 32:
+            # Match DEAP even-channel protocol used in MAE runs: 0,2,...,30
+            indices = np.arange(0, 32, 2, dtype=int)
+        else:
+            indices = np.linspace(0, n_channels - 1, target_channels, dtype=int)
         X_sub = X[:, indices, :]
         
         def bandpass_filter(data):
@@ -182,22 +244,40 @@ class STADDataset(Dataset):
 
 # ✅ CRITICAL FIX: Proper dimension alignment
 class STAD(nn.Module):
-    def __init__(self, lr_channels=16, hr_channels=32, seq_len=400, latent_dim=256, n_harmonics=8):
+    def __init__(
+        self,
+        lr_channels=16,
+        hr_channels=32,
+        seq_len=400,
+        latent_dim=256,
+        n_harmonics=8,
+        mae_patch_size=4,
+        mae_depth=6,
+        mae_num_heads=8,
+        mae_decoder_embed_dim=128,
+        mae_decoder_depth=4,
+        mae_decoder_num_heads=8,
+        mae_mlp_ratio=4.0,
+        mae_norm_pix_loss=True,
+    ):
         super().__init__()
         
-        patch_size = 4
-        num_patches = seq_len // patch_size  # 100
+        patch_size = mae_patch_size
+        num_patches = seq_len // patch_size
         
         # MAE (embed_dim=256)
         self.mae = MAEforEEG(
             time_len=seq_len,
             patch_size=patch_size,
-            embed_dim=256,
+            embed_dim=latent_dim,
             in_chans=hr_channels,
-            depth=6,
-            num_heads=8,
-            decoder_embed_dim=128,
-            decoder_depth=4
+            depth=mae_depth,
+            num_heads=mae_num_heads,
+            decoder_embed_dim=mae_decoder_embed_dim,
+            decoder_depth=mae_decoder_depth,
+            decoder_num_heads=mae_decoder_num_heads,
+            mlp_ratio=mae_mlp_ratio,
+            norm_pix_loss=mae_norm_pix_loss,
         )
         
         # ✅ FIX: STC with embed_dim=256 (not 128!)
@@ -221,10 +301,33 @@ class STAD(nn.Module):
         
         self.latent_dim = latent_dim
         self.num_patches = num_patches
+        self.lr_channels = lr_channels
+
+    def mae_encode_no_mask(self, eeg):
+        """Exact no-mask encoder forward for trial_mae_DEAP MAE."""
+        x = self.mae.patch_embed(eeg)
+        x = x + self.mae.pos_embed[:, 1:, :]
+        cls_token = self.mae.cls_token + self.mae.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        for blk in self.mae.blocks:
+            x = blk(x)
+        x = self.mae.norm(x)
+        return x
+
+    def mae_decode_full(self, encoded_with_cls):
+        """Exact full-sequence decoder forward for trial_mae_DEAP MAE."""
+        x = self.mae.decoder_embed(encoded_with_cls)
+        x = x + self.mae.decoder_pos_embed
+        for blk in self.mae.decoder_blocks:
+            x = blk(x)
+        x = self.mae.decoder_norm(x)
+        x = self.mae.decoder_pred(x)
+        return x[:, 1:, :]
     
     def encode_hr(self, hr_eeg):
         """Encode HR to latent (unnormalized for diffusion)"""
-        latent = self.mae.encode_no_mask(hr_eeg)  # (B, 101, 256)
+        latent = self.mae_encode_no_mask(hr_eeg)
         latent = latent[:, 1:, :]  # Remove CLS → (B, 100, 256)
         
         # Don't normalize - diffusion models work better with unnormalized latents
@@ -235,12 +338,80 @@ class STAD(nn.Module):
         cond_tokens, cond_pooled = self.stc(lr_eeg, lr_chan_pos, t_steps)
         return self.mtd(zt, t_steps, cond_tokens, cond_pooled)
 
-def train_stad_fixed(dataset_path, num_epochs=300, batch_size=32, lr=2e-4):
+def train_stad_fixed(
+    dataset_path,
+    num_epochs=300,
+    batch_size=32,
+    lr=2e-4,
+    mae_results_dir=None,
+    mae_fold=None,
+    require_full_mae_latent=True,
+):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"🚀 STAD Training (DIMENSION FIXED)")
+
+    # Defaults for full SR(16->32): HR latent space is 32-channel EEG.
+    hr_channels = 32
+    lr_channels = 16
+    seq_len = 1000
+    latent_dim = 256
+    mae_patch_size = 8
+    mae_depth = 12
+    mae_num_heads = 12
+    mae_decoder_embed_dim = 384
+    mae_decoder_depth = 4
+    mae_decoder_num_heads = 8
+    mae_mlp_ratio = 4.0
+    mae_norm_pix_loss = True
+
+    if mae_results_dir is not None and os.path.isdir(mae_results_dir):
+        ckpt_path, selected = _resolve_best_kfold_checkpoint(mae_results_dir, preferred_fold=mae_fold)
+        ckpt_preview = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        cfg = ckpt_preview.get('config', {})
+
+        checkpoint_in_chans = int(cfg.get('in_chans', hr_channels))
+        if require_full_mae_latent and checkpoint_in_chans != hr_channels:
+            raise ValueError(
+                "Full latent transfer for SR 16->32 requires a MAE checkpoint trained with in_chans=32, "
+                f"but this checkpoint has in_chans={checkpoint_in_chans}. "
+                "Use a 32-channel MAE k-fold results directory."
+            )
+
+        hr_channels = checkpoint_in_chans
+        lr_channels = 16
+        seq_len = int(cfg.get('time_len', seq_len))
+        latent_dim = int(cfg.get('embed_dim', latent_dim))
+        mae_patch_size = int(cfg.get('patch_size', mae_patch_size))
+        mae_depth = int(cfg.get('depth', mae_depth))
+        mae_num_heads = int(cfg.get('num_heads', mae_num_heads))
+        mae_decoder_embed_dim = int(cfg.get('decoder_embed_dim', mae_decoder_embed_dim))
+        mae_decoder_depth = int(cfg.get('decoder_depth', mae_decoder_depth))
+        mae_decoder_num_heads = int(cfg.get('decoder_num_heads', mae_decoder_num_heads))
+        mae_mlp_ratio = float(cfg.get('mlp_ratio', mae_mlp_ratio))
+        mae_norm_pix_loss = bool(cfg.get('norm_pix_loss', mae_norm_pix_loss))
+
+        print(
+            f"📌 Using MAE config from fold {selected['fold']} in {mae_results_dir}: "
+            f"C={hr_channels}, T={seq_len}, patch={mae_patch_size}, latent={latent_dim}"
+        )
+
+    if seq_len % mae_patch_size != 0:
+        raise ValueError(f"seq_len={seq_len} must be divisible by mae_patch_size={mae_patch_size}")
     
-    train_dataset = STADDataset(dataset_path, 'train', window_size=400)
-    val_dataset = STADDataset(dataset_path, 'val', window_size=400)
+    train_dataset = STADDataset(
+        dataset_path,
+        'train',
+        lr_channels=lr_channels,
+        hr_channels=hr_channels,
+        window_size=seq_len,
+    )
+    val_dataset = STADDataset(
+        dataset_path,
+        'val',
+        lr_channels=lr_channels,
+        hr_channels=hr_channels,
+        window_size=seq_len,
+    )
     train_loader = DataLoader(train_dataset, batch_size, shuffle=True, num_workers=4, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size, shuffle=False, num_workers=2)
     
@@ -248,24 +419,39 @@ def train_stad_fixed(dataset_path, num_epochs=300, batch_size=32, lr=2e-4):
     
     # ✅ Model with correct dimensions
     model = STAD(
-        lr_channels=16,
-        hr_channels=32,
-        seq_len=400,
-        latent_dim=256,  # Matches MAE
-        n_harmonics=8
+        lr_channels=lr_channels,
+        hr_channels=hr_channels,
+        seq_len=seq_len,
+        latent_dim=latent_dim,
+        n_harmonics=8,
+        mae_patch_size=mae_patch_size,
+        mae_depth=mae_depth,
+        mae_num_heads=mae_num_heads,
+        mae_decoder_embed_dim=mae_decoder_embed_dim,
+        mae_decoder_depth=mae_decoder_depth,
+        mae_decoder_num_heads=mae_decoder_num_heads,
+        mae_mlp_ratio=mae_mlp_ratio,
+        mae_norm_pix_loss=mae_norm_pix_loss,
     ).to(device)
     
     # Load pretrained MAE
-    mae_checkpoint = 'mae_deap_FIXED.pt'
-    if os.path.exists(mae_checkpoint):
-        mae_state = torch.load(mae_checkpoint, map_location=device, weights_only=False)
-        model.mae.load_state_dict(mae_state)
-        print(f"✅ Loaded MAE from {mae_checkpoint}")
+    if mae_results_dir is not None and os.path.isdir(mae_results_dir):
+        _cfg, _path = _load_mae_from_kfold_results(model.mae, mae_results_dir, device, preferred_fold=mae_fold)
+    else:
+        mae_checkpoint = 'mae_deap_FIXED.pt'
+        if os.path.exists(mae_checkpoint):
+            mae_state = torch.load(mae_checkpoint, map_location=device, weights_only=False)
+            if isinstance(mae_state, dict) and 'model_state_dict' in mae_state:
+                mae_state = mae_state['model_state_dict']
+            model.mae.load_state_dict(mae_state, strict=True)
+            print(f"✅ Loaded MAE from {mae_checkpoint}")
+        else:
+            print("⚠️  No MAE checkpoint found. Training STAD from randomly initialized MAE.")
         
-        # Freeze encoder initially
-        for p in model.mae.parameters():
-            p.requires_grad = False
-        print("🔒 MAE frozen")
+    # Freeze encoder initially
+    for p in model.mae.parameters():
+        p.requires_grad = False
+    print("🔒 MAE frozen")
     
     # Diffusion
     T = 1000
@@ -320,7 +506,7 @@ def train_stad_fixed(dataset_path, num_epochs=300, batch_size=32, lr=2e-4):
                 zt = sqrt_alpha * z0 + sqrt_one_minus * epsilon
                 
                 # Conditioning
-                lr_pos = get_channel_positions(16, device, B)
+                lr_pos = get_channel_positions(model.lr_channels, device, B)
                 
                 # Predict noise
                 pred_epsilon = model(x_lr, zt, t, lr_pos)
@@ -354,7 +540,7 @@ def train_stad_fixed(dataset_path, num_epochs=300, batch_size=32, lr=2e-4):
                 sqrt_one_minus = diff_params['sqrt_one_minus_alphas_cumprod'][t].view(B, 1, 1)
                 zt = sqrt_alpha * z0 + sqrt_one_minus * epsilon
                 
-                lr_pos = get_channel_positions(16, device, B)
+                lr_pos = get_channel_positions(model.lr_channels, device, B)
                 pred_epsilon = model(x_lr, zt, t, lr_pos)
                 val_loss += criterion(pred_epsilon, epsilon).item()
         
@@ -393,5 +579,6 @@ if __name__ == '__main__':
         '/home/ab_students/EEG-MTP/codes/DEAP_split_dataset.npz',
         num_epochs=300,
         batch_size=32,
-        lr=2e-4
+        lr=2e-4,
+        mae_results_dir='/home/ab_students/EEG-MTP/trial_mae_DEAP/results_kfold_prcoutput_mask75_val75',
     )

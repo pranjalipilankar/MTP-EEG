@@ -10,7 +10,7 @@ class NativeScalerWithGradNormCount:
     state_dict_key = "amp_scaler"
 
     def __init__(self):
-        self._scaler = torch.cuda.amp.GradScaler()
+        self._scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
 
     def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True):
         self._scaler.scale(loss).backward(create_graph=create_graph)
@@ -50,6 +50,37 @@ def get_grad_norm_(parameters, norm_type: float = 2.0):
     return total_norm
 
 
+def _mean_reconstruction_correlation(pred_patches, target_signals, model_without_ddp):
+    """Compute mean Pearson correlation on full reconstructed signals."""
+    model_ref = model_without_ddp if model_without_ddp is not None else None
+    if model_ref is None:
+        return 0.0
+
+    with torch.no_grad():
+        corr = _batch_reconstruction_correlation(pred_patches, target_signals, model_ref)
+    return float(corr.item())
+
+
+def _batch_reconstruction_correlation(pred_patches, target_signals, model_ref, eps=1e-8):
+    """Compute differentiable batch mean Pearson correlation on full reconstructions."""
+    pred = model_ref.unpatchify(pred_patches)
+    target = target_signals
+
+    pred = pred.reshape(pred.shape[0], -1)
+    target = target.reshape(target.shape[0], -1)
+
+    pred_centered = pred - pred.mean(dim=1, keepdim=True)
+    target_centered = target - target.mean(dim=1, keepdim=True)
+
+    numerator = (pred_centered * target_centered).sum(dim=1)
+    denominator = torch.sqrt(
+        pred_centered.pow(2).sum(dim=1) * target_centered.pow(2).sum(dim=1)
+    ) + eps
+
+    corr_per_sample = numerator / denominator
+    return corr_per_sample.mean()
+
+
 def train_one_epoch(model, data_loader, optimizer, device, epoch, 
                         loss_scaler, log_writer=None, config=None, start_time=None, model_without_ddp=None, 
                         img_feature_extractor=None, preprocess=None):
@@ -57,6 +88,7 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch,
     optimizer.zero_grad()
     total_loss = []
     total_cor = []
+    corr_loss_weight = float(getattr(config, 'corr_loss_weight', 0.0)) if config is not None else 0.0
     accum_iter = config.accum_iter
     for data_iter_step, (data_dcit) in enumerate(data_loader):
         
@@ -80,8 +112,12 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch,
         # img_features = img_features.to(device)
 
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
             loss, pred, _ = model(samples, img_features, valid_idx=valid_idx, mask_ratio=config.mask_ratio)
+            model_ref = model_without_ddp if model_without_ddp is not None else model
+            corr_tensor = _batch_reconstruction_correlation(pred, samples, model_ref)
+            if corr_loss_weight > 0:
+                loss = loss + corr_loss_weight * (1.0 - corr_tensor)
         # loss.backward()
         # norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad)
         # optimizer.step()
@@ -95,33 +131,7 @@ def train_one_epoch(model, data_loader, optimizer, device, epoch,
         # loss /= accum_iter
         loss_scaler(loss, optimizer, parameters=model.parameters(), clip_grad=config.clip_grad)
 
-        # if (data_iter_step + 1) % accum_iter == 0:
-        # cal the cor
-        pred = pred.to('cpu').detach()
-        samples = samples.to('cpu').detach()
-        # pred = pred.transpose(1,2) #model_without_ddp.unpatchify(pred)
-        pred = model_without_ddp.unpatchify(pred)
-        # print(pred.shape)
-        # print(samples.shape)
-        # for p, s in zip(pred, samples):
-        #     print(p[0], s[0])
-        #     print(torch.cat([p[0].unsqueeze(0), s[0].unsqueeze(0)],axis=0))
-        #     print(torch.corrcoef(torch.cat([p[0].unsqueeze(0), s[0].unsqueeze(0)],axis=0)))
-        #     print(torch.corrcoef(torch.cat([p[0].unsqueeze(0), s[0].unsqueeze(0)],axis=0))[0,1])
-            
-        cor_list = []
-        for p, s in zip(pred, samples):
-            # Compute correlation per channel, then average
-            channel_cors = []
-            for c in range(p.shape[0]):  # Iterate over channels
-                if torch.std(p[c]) > 1e-6 and torch.std(s[c]) > 1e-6:
-                    channel_cors.append(
-                        torch.corrcoef(torch.stack([p[c], s[c]]))[0, 1]
-                    )
-            if channel_cors:
-                cor_list.append(torch.mean(torch.stack(channel_cors)))
-
-        cor = torch.mean(torch.stack(cor_list)).item() if cor_list else 0.0 
+        cor = float(corr_tensor.detach().item())
         optimizer.zero_grad()
 
         total_loss.append(loss_value)

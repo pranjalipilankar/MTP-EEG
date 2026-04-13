@@ -22,16 +22,18 @@ class Config_MAE_DEAP():
         self.accum_iter = 1
         
         # ============================================
-        # Model Parameters (Keep Original Design)
+        # Model Parameters (SEED4-like MAE backbone)
         # ============================================
         self.mask_ratio = 0.75      # ✓ Keep 75% as in paper
-        self.patch_size = 16        # ✓ Good for 8064 samples
-        self.embed_dim = 1024       # ✓ Standard MAE size
-        self.decoder_embed_dim = 512
-        self.depth = 24
-        self.num_heads = 16
-        self.decoder_num_heads = 16
-        self.mlp_ratio = 1.0
+        self.patch_size = 8         # More temporal patches for EEG dynamics
+        self.embed_dim = 768        # Match SEED4 encoder width
+        self.decoder_embed_dim = 384
+        self.depth = 12
+        self.num_heads = 12
+        self.decoder_num_heads = 8
+        self.decoder_depth = 4
+        self.mlp_ratio = 4.0
+        self.norm_pix_loss = True   # Stable MAE target normalization
         
         # ============================================
         # DEAP Dataset Parameters

@@ -2,6 +2,7 @@
 """Evaluate STAD checkpoint on SEED-IV preprocessed data."""
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -90,7 +91,17 @@ class SEED4PreprocessedDataset(Dataset):
         self.hr_indices = get_seed4_channel_indices(hr_channels)
 
         data_path = Path(data_path)
+
+        if data_path.is_file() and data_path.suffix == '.npz':
+            self._load_from_npz(data_path)
+            return
+
         all_windows = []
+        all_subject_ids = []
+        all_session_ids = []
+        all_trial_ids = []
+        all_norm_stats = []
+        prc1_meta = None
 
         for subject_id in subjects:
             for session in ['1', '2', '3']:
@@ -101,8 +112,37 @@ class SEED4PreprocessedDataset(Dataset):
                 subject_folders = list(session_path.glob(f'{subject_id}_*'))
                 for folder in subject_folders:
                     x_file = folder / 'X_prc1.npy'
+                    stats_file = folder / 'X_prc1_norm_stats.npy'
+                    meta_file = folder / 'prc1_meta.json'
+                    trial_labels_file = folder / 'trial_labels.json'
                     if x_file.exists():
-                        all_windows.append(np.load(x_file))
+                        x_data = np.load(x_file)
+                        trial_ids = None
+                        if trial_labels_file.exists():
+                            with open(trial_labels_file, 'r', encoding='utf-8') as f:
+                                trial_meta = json.load(f)
+                            windows_per_trial = trial_meta.get('windows_per_trial', None)
+                            if windows_per_trial is not None:
+                                trial_seq = []
+                                for tid, n_w in enumerate(windows_per_trial):
+                                    trial_seq.extend([tid] * int(n_w))
+                                if len(trial_seq) == len(x_data):
+                                    trial_ids = np.array(trial_seq, dtype=int)
+
+                        if trial_ids is None:
+                            # Fallback: keep IDs in valid SEED-IV range.
+                            trial_ids = np.arange(len(x_data), dtype=int) % 24
+                        all_windows.append(x_data)
+                        all_subject_ids.extend([str(subject_id)] * len(x_data))
+                        all_session_ids.extend([str(session)] * len(x_data))
+                        all_trial_ids.extend(trial_ids.tolist())
+                        if stats_file.exists():
+                            s_data = np.load(stats_file)
+                            if len(s_data) == len(x_data):
+                                all_norm_stats.append(s_data)
+                        if prc1_meta is None and meta_file.exists():
+                            with open(meta_file, 'r', encoding='utf-8') as f:
+                                prc1_meta = json.load(f)
 
         if not all_windows:
             raise ValueError(f"No preprocessed data found for subjects {subjects} at {data_path}")
@@ -111,8 +151,67 @@ class SEED4PreprocessedDataset(Dataset):
         self.sr_samples = all_windows
         self.hr_samples = all_windows[:, self.hr_indices, :]
         self.lr_samples = all_windows[:, self.lr_indices, :]
+        self.subject_ids = np.array(all_subject_ids)
+        self.session_ids = np.array(all_session_ids)
+        self.trial_ids = np.array(all_trial_ids, dtype=int)
+        self.prc1_meta = prc1_meta
+        if all_norm_stats and sum(len(s) for s in all_norm_stats) == len(self.sr_samples):
+            self.norm_stats = np.concatenate(all_norm_stats, axis=0).astype(np.float32)
+        else:
+            self.norm_stats = None
 
         print(f"Loaded {len(self.sr_samples)} test windows from subjects {subjects}")
+
+    def _load_from_npz(self, npz_path):
+        """Load test data from npz payload (supports multiple key layouts)."""
+        payload = np.load(npz_path, allow_pickle=True)
+
+        if 'SR' in payload:
+            sr_all = payload['SR'].astype(np.float32)
+            if 'test_indices' in payload:
+                idx = payload['test_indices'].astype(int)
+                sr = sr_all[idx]
+            else:
+                sr = sr_all
+        elif 'X_test' in payload:
+            sr = payload['X_test'].astype(np.float32)
+        else:
+            raise KeyError(
+                f"Unsupported npz format: {npz_path}. Expected SR (+optional test_indices) or X_test key."
+            )
+
+        self.sr_samples = sr
+        self.hr_samples = sr[:, self.hr_indices, :]
+        self.lr_samples = sr[:, self.lr_indices, :]
+        self.norm_stats = None
+        self.prc1_meta = None
+
+        n = len(sr)
+        if 'subject_ids' in payload and len(payload['subject_ids']) >= n:
+            if 'test_indices' in payload:
+                self.subject_ids = np.asarray(payload['subject_ids'])[payload['test_indices']].astype(str)
+            else:
+                self.subject_ids = np.asarray(payload['subject_ids'][:n]).astype(str)
+        else:
+            self.subject_ids = np.array([f'unknown_{i:05d}' for i in range(n)])
+
+        if 'session_ids' in payload and len(payload['session_ids']) >= n:
+            if 'test_indices' in payload:
+                self.session_ids = np.asarray(payload['session_ids'])[payload['test_indices']].astype(str)
+            else:
+                self.session_ids = np.asarray(payload['session_ids'][:n]).astype(str)
+        else:
+            self.session_ids = np.array(['1'] * n)
+
+        if 'trial_ids' in payload and len(payload['trial_ids']) >= n:
+            if 'test_indices' in payload:
+                self.trial_ids = np.asarray(payload['trial_ids'])[payload['test_indices']].astype(int)
+            else:
+                self.trial_ids = np.asarray(payload['trial_ids'][:n]).astype(int)
+        else:
+            self.trial_ids = np.arange(n, dtype=int)
+
+        print(f"Loaded {n} test windows from npz: {npz_path}")
 
     def __len__(self):
         return len(self.sr_samples)
@@ -122,6 +221,9 @@ class SEED4PreprocessedDataset(Dataset):
             'lr': torch.from_numpy(self.lr_samples[idx]).float(),
             'hr': torch.from_numpy(self.hr_samples[idx]).float(),
             'sr': torch.from_numpy(self.sr_samples[idx]).float(),
+            'subject_id': self.subject_ids[idx],
+            'session_id': self.session_ids[idx],
+            'trial_id': self.trial_ids[idx],
         }
 
 
@@ -192,12 +294,20 @@ def evaluate(args):
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    data_path = args.data_path
+    # Common naming mismatch: use preprocessed_data.npz if eeg_processed_data.npz was provided.
+    if data_path.endswith('eeg_processed_data.npz') and not Path(data_path).exists():
+        fallback = data_path.replace('eeg_processed_data.npz', 'preprocessed_data.npz')
+        if Path(fallback).exists():
+            print(f"Info: {data_path} not found, using {fallback}")
+            data_path = fallback
+
     splits = create_split(n_folds=5, test_fold=args.test_fold)
     test_subjects = splits['test']
     print(f"Test subjects: {test_subjects}")
 
     dataset = SEED4PreprocessedDataset(
-        data_path=args.data_path,
+        data_path=data_path,
         subjects=test_subjects,
         lr_channels=16,
         hr_channels=31,
@@ -246,12 +356,20 @@ def evaluate(args):
     pcc_scores = []
     nmse_scores = []
     snr_scores = []
+    saved_pred_sr = []
+    saved_target_sr = []
+    saved_subject_ids = []
+    saved_session_ids = []
+    saved_trial_ids = []
 
     with torch.no_grad():
         for i, batch in enumerate(tqdm(loader, desc='Testing')):
             lr_eeg = batch['lr'].to(device)
             hr_eeg = batch['hr'].to(device)
             sr_eeg = batch['sr'].to(device)
+            subject_ids = list(batch['subject_id'])
+            session_ids = list(batch['session_id'])
+            trial_ids = batch['trial_id'].cpu().numpy().astype(int).tolist()
 
             if args.use_sampling:
                 pred_sr = model.sample_sr(lr_eeg, num_inference_steps=args.num_inference_steps)
@@ -261,6 +379,12 @@ def evaluate(args):
 
             sr_loss = F.l1_loss(pred_sr.float(), sr_eeg.float())
             metrics = compute_sr_metrics(pred_sr.float(), sr_eeg.float())
+
+            saved_pred_sr.append(pred_sr.detach().cpu().numpy())
+            saved_target_sr.append(sr_eeg.detach().cpu().numpy())
+            saved_subject_ids.extend(subject_ids)
+            saved_session_ids.extend(session_ids)
+            saved_trial_ids.extend(trial_ids)
 
             diff_losses.append(float(diff_loss.item()))
             sr_losses.append(float(sr_loss.item()))
@@ -305,12 +429,56 @@ def evaluate(args):
     if fig_dir is not None:
         print(f"Saved EEG figures: {saved_figures} -> {fig_dir}")
 
+    if args.save_sr_output_path:
+        sr_out = np.concatenate(saved_pred_sr, axis=0)
+        save_path = Path(args.save_sr_output_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(save_path, sr_out)
+        print(f"Saved predicted SR EEG: {sr_out.shape} -> {save_path}")
+
+        if args.save_target_output_path:
+            target_out = np.concatenate(saved_target_sr, axis=0)
+            target_path = Path(args.save_target_output_path)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(target_path, target_out)
+            print(f"Saved target SR EEG: {target_out.shape} -> {target_path}")
+
+        if args.save_test_metadata_path:
+            meta_path = Path(args.save_test_metadata_path)
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(
+                meta_path,
+                subject_ids=np.array(saved_subject_ids),
+                session_ids=np.array(saved_session_ids),
+                trial_ids=np.array(saved_trial_ids, dtype=int),
+            )
+            print(f"Saved test metadata: {meta_path}")
+
+        if args.save_norm_stats_path:
+            if getattr(dataset, 'norm_stats', None) is None:
+                print("Warning: norm stats unavailable for this data source; not saved.")
+            else:
+                stats_path = Path(args.save_norm_stats_path)
+                stats_path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(stats_path, dataset.norm_stats)
+                print(f"Saved norm stats: {dataset.norm_stats.shape} -> {stats_path}")
+
+        if args.save_prc1_meta_path:
+            if getattr(dataset, 'prc1_meta', None) is None:
+                print("Warning: PrC-1 meta unavailable for this data source; not saved.")
+            else:
+                meta_json_path = Path(args.save_prc1_meta_path)
+                meta_json_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(meta_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(dataset.prc1_meta, f, indent=2)
+                print(f"Saved PrC-1 meta: {meta_json_path}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Test STAD on SEED-IV preprocessed data')
     parser.add_argument('--data_path', type=str,
                         default='/home/ab_students/EEG-MTP/DATA/seed4/eeg_processed_data',
-                        help='Path to preprocessed SEED-IV folder')
+                        help='Path to preprocessed SEED-IV folder OR npz file (SR/X_test)')
     parser.add_argument('--mae_checkpoint', type=str, required=True,
                         help='Path to pretrained MAE checkpoint')
     parser.add_argument('--stad_checkpoint', type=str,
@@ -336,5 +504,15 @@ if __name__ == '__main__':
                         help='Directory to save EEG signal figures (empty to disable)')
     parser.add_argument('--num_fig_samples', type=int, default=3,
                         help='How many samples to plot as EEG figures')
+    parser.add_argument('--save_sr_output_path', type=str, default='',
+                        help='Optional path to save predicted SR EEG windows (.npy)')
+    parser.add_argument('--save_target_output_path', type=str, default='',
+                        help='Optional path to save target SR EEG windows (.npy)')
+    parser.add_argument('--save_test_metadata_path', type=str, default='',
+                        help='Optional path to save test metadata (.npz with subject_ids/session_ids)')
+    parser.add_argument('--save_norm_stats_path', type=str, default='',
+                        help='Optional path to save PrC-1 norm stats (.npy) for reconstruction reversal')
+    parser.add_argument('--save_prc1_meta_path', type=str, default='',
+                        help='Optional path to save PrC-1 meta (.json) for reconstruction reversal')
 
     evaluate(parser.parse_args())

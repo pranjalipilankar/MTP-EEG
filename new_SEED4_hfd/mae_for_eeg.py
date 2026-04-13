@@ -29,10 +29,10 @@ class MAEforEEG(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
     """
     def __init__(self, time_len=512, patch_size=4, embed_dim=1024, in_chans=128,
-                 depth=24, num_heads=16, decoder_embed_dim=512,
+                 depth=24, num_heads=16, decoder_embed_dim=512, 
                  decoder_depth=8, decoder_num_heads=16,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm, focus_range=None, focus_rate=None, img_recon_weight=1.0,
-                 use_nature_img_loss=False, norm_pix_loss=True):
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, focus_range=None, focus_rate=None, img_recon_weight=1.0, 
+                 use_nature_img_loss=False):
         super().__init__()
 
         # --------------------------------------------------------------------------
@@ -92,7 +92,6 @@ class MAEforEEG(nn.Module):
         self.focus_rate = focus_rate
         self.img_recon_weight = img_recon_weight
         self.use_nature_img_loss = use_nature_img_loss
-        self.norm_pix_loss = norm_pix_loss
    
         self.initialize_weights()
 
@@ -316,12 +315,6 @@ class MAEforEEG(nn.Module):
         """
         # Don't transpose - patchify now handles correct dimensions
         target = self.patchify(imgs)  # [32, 504, 512]
-
-        # MAE-style normalized pixel target improves optimization stability.
-        if self.norm_pix_loss:
-            mean = target.mean(dim=-1, keepdim=True)
-            var = target.var(dim=-1, keepdim=True)
-            target = (target - mean) / (var + 1.0e-6).sqrt()
         
         # Both pred and target are now [N, num_patches, C*p]
         loss = (pred - target) ** 2

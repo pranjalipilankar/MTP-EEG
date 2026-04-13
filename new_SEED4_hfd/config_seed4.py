@@ -35,7 +35,7 @@ class Config_MAE_SEED4:
         # ============================================
         # SEED-IV Dataset Parameters
         # ============================================
-        self.data_path = '/DATA/EEG-MTP/seed4/preprocessed_data.npz'
+        self.data_path = '/home/ab_students/EEG-MTP/DATA/seed4/eeg_processed_data'
         self.num_channels = 62      # SEED-IV has 62 channels
         self.time_len = 1000        # Window length (4 seconds @ 250Hz)
         self.sampling_rate = 250    # SEED-IV sampling rate

@@ -2,42 +2,53 @@ import os
 import pickle
 import numpy as np
 
-# Path to preprocessed DEAP data folder containing the .dat files
-data_dir = "/home/ab_students/EEG-MTP/DATA"
+# --- Updated Path to your user directory ---
+data_dir = "/DATA/EEG-MTP/DEAP"
 
-# Dictionary to hold the labels for easy lookup later
 subject_labels = {}
 all_labels_flat = []
 
-print("Extracting labels...")
+print(f"Extracting and Printing labels from: {data_dir}")
+print("-" * 50)
 
 # Loop through all 32 subjects
 for i in range(1, 33):
-    subject_id = f"s{i:02d}"  # Creates strings like 's01', 's02'
+    subject_id = f"s{i:02d}"  
     filename = os.path.join(data_dir, f"{subject_id}.dat")
     
+    if not os.path.exists(filename):
+        # Silent skip if file missing, or print warning
+        continue
+
     with open(filename, 'rb') as f:
+        # DEAP .dat files use latin1 encoding
         data = pickle.load(f, encoding='latin1')
 
-    # Extract ONLY the labels. 
-    # Shape is (40, 4) -> 40 videos, 4 emotional metrics
-    # Columns are: [Valence, Arousal, Dominance, Liking]
+    # Extract labels (40, 4)
     labels = data['labels']              
+    
+    # --- PRINT AS ARRAY ---
+    print(f"\n{subject_id.upper()} Labels Array (Trial x Emotion):")
+    # np.array2string makes it clean, or just print(labels)
+    print(labels) 
 
-    # Store in dictionary and list
     subject_labels[subject_id] = labels
     all_labels_flat.append(labels)
 
-# Combine all participants into one big array (if you still want the 1280x4 shape)
-combined_labels = np.vstack(all_labels_flat)      
-print(f"Combined labels shape: {combined_labels.shape} (1280 trials x 4 metrics)")
+if all_labels_flat:
+    # Combine into one big array (1280, 4)
+    combined_labels = np.vstack(all_labels_flat)      
+    
+    print(f"\n{'='*60}")
+    print("FINAL COMBINED LABELS ARRAY (All 32 Subjects):")
+    print("-" * 60)
+    print(combined_labels)
+    
+    print(f"\nShape: {combined_labels.shape}")
 
-# Save the labels out to a lightweight .npz file
-save_path = "DEAP_labels_only.npz"
-np.savez(save_path, **subject_labels)
-print(f"\nSuccessfully saved labels to {save_path}")
-
-# --- Example of how to load and use this in your BDF script ---
-# loaded_labels = np.load("DEAP_labels_only.npz")
-# s01_labels = loaded_labels['s01']
-# print("Subject 1 labels shape:", s01_labels.shape)
+    # Save to a lightweight file for your BDF pipeline
+    save_path = "DEAP_labels_only.npz"
+    np.savez(save_path, **subject_labels)
+    print(f"\nSuccessfully saved labels to {save_path}")
+else:
+    print(f"\nNo labels found. Check if .dat files are in {data_dir}")
