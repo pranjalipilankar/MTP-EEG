@@ -1,0 +1,3 @@
+[submodule "Downstream/EEGain"]
+	path = Downstream/EEGain
+	url = https://github.com/EmotionLab/EEGain.git
