@@ -69,9 +69,16 @@ def compute_graph_harmonics(chan_pos, k=8, n_neighbors=4):
     
     # Take first k+1 eigenvectors (skip the constant first one)
     # These are the "harmonic" basis functions on the electrode graph
-    if k + 1 > C:
-        k = C - 1
-    basis = eigenvectors[:, 1:k+1]  # (C, k)
+    max_k = max(1, C - 1)
+    use_k = min(k, max_k)
+    basis = eigenvectors[:, 1:use_k + 1]  # (C, use_k)
+
+    # Keep output width fixed at requested k so downstream Linear(k -> embed_dim) is stable.
+    if use_k < k:
+        pad = np.zeros((C, k - use_k), dtype=basis.dtype)
+        basis = np.concatenate([basis, pad], axis=1)
+    elif use_k > k:
+        basis = basis[:, :k]
     
     return torch.tensor(basis, dtype=torch.float32)
 
