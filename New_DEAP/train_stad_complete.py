@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import json
 import sys
+import shutil
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
@@ -22,6 +23,49 @@ sys.path.insert(0, '/home/ab_students/EEG-MTP/trial_mae_DEAP')
 from mae_for_eeg import MAEforEEG
 from spatio_temporal_condition import SpatioTemporalConditionModule  
 from mtd_dreamdiff import MultiScaleTransformerDenoisingModule
+
+
+def _safe_save_checkpoint(payload, save_path, lite_exclude_prefix='mae.'):
+    """Save checkpoint robustly; fall back to lite model payload on write failures."""
+    full_payload = dict(payload)
+    full_payload['checkpoint_type'] = 'full'
+
+    try:
+        os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+        torch.save(full_payload, save_path)
+        return True, save_path, 'full'
+    except Exception as e:
+        print(f"⚠️  Full checkpoint save failed at {save_path}: {e}")
+
+    lite_payload = dict(full_payload)
+    model_state = lite_payload.get('model', {})
+    if isinstance(model_state, dict):
+        lite_payload['model'] = {
+            k: v for k, v in model_state.items()
+            if not k.startswith(lite_exclude_prefix)
+        }
+    lite_payload['checkpoint_type'] = 'lite_no_mae'
+
+    fallback_dir = '/tmp/EEG-MTP/New_DEAP_checkpoints'
+    os.makedirs(fallback_dir, exist_ok=True)
+    lite_name = os.path.basename(save_path)
+    if lite_name.endswith('.pt'):
+        lite_name = lite_name.replace('.pt', '_lite.pt')
+    elif lite_name.endswith('.pth'):
+        lite_name = lite_name.replace('.pth', '_lite.pth')
+    else:
+        lite_name = f"{lite_name}_lite.pt"
+    fallback_path = os.path.join(fallback_dir, lite_name)
+
+    try:
+        # Best-effort free-space report for debugging storage issues.
+        free_gb = shutil.disk_usage('/tmp').free / (1024 ** 3)
+        print(f"ℹ️  Retrying with lightweight checkpoint in /tmp (free={free_gb:.1f}GB)")
+        torch.save(lite_payload, fallback_path)
+        return True, fallback_path, 'lite_no_mae'
+    except Exception as e:
+        print(f"❌ Fallback checkpoint save also failed at {fallback_path}: {e}")
+        return False, '', 'none'
 
 
 def _resolve_best_kfold_checkpoint(results_dir, preferred_fold=None):
@@ -160,6 +204,27 @@ def get_channel_positions(n_channels, device='cpu', batch_size=1):
         raise ValueError(f"Unsupported n_channels={n_channels} for channel positions")
     return torch.tensor(positions, device=device).unsqueeze(0).expand(batch_size, -1, -1)
 
+
+def compute_sr_metrics_torch(pred_sr, target_sr, eps=1e-8):
+    """Batch-level SR metrics (PCC, NMSE, SNR dB) in torch."""
+    pred = pred_sr.reshape(pred_sr.shape[0], -1)
+    target = target_sr.reshape(target_sr.shape[0], -1)
+
+    pred_centered = pred - pred.mean(dim=1, keepdim=True)
+    target_centered = target - target.mean(dim=1, keepdim=True)
+    numerator = (pred_centered * target_centered).sum(dim=1)
+    denominator = torch.sqrt(
+        (pred_centered.pow(2).sum(dim=1) + eps) *
+        (target_centered.pow(2).sum(dim=1) + eps)
+    )
+    pcc = (numerator / denominator).mean().item()
+
+    mse = (pred - target).pow(2).mean(dim=1)
+    signal_power = target.pow(2).mean(dim=1)
+    nmse = (mse / (signal_power + eps)).mean().item()
+    snr = (10.0 * torch.log10((signal_power + eps) / (mse + eps))).mean().item()
+    return {'PCC': pcc, 'NMSE': nmse, 'SNR': snr}
+
 def reconstruct_eeg_fixed(model, x_lr, diff_params, device, steps=50):
     """FIXED reconstruction with proper dimensions"""
     model.eval()
@@ -197,16 +262,13 @@ def reconstruct_eeg_fixed(model, x_lr, diff_params, device, steps=50):
             else:
                 zt = pred_x0
         
-        # Decode
-        cls_token = model.mae.cls_token.expand(B, -1, -1)
-        zt_with_cls = torch.cat([cls_token, zt], dim=1)
-        pred_patches = model.mae_decode_full(zt_with_cls)
-        sr_eeg = model.mae.unpatchify(pred_patches)
+        # Decode latent to SR through the model SR head.
+        sr_eeg = model.latent_to_sr(zt)
         
         return sr_eeg
 
 def validate_reconstruction(model, val_loader, diff_params, device):
-    """Validate with proper metrics"""
+    """Validate with proper metrics - now comparing HR channels since MAE is trained on HR"""
     metrics = {'PCC': [], 'SNR': [], 'NMSE': [], 'MAE': []}
     
     with torch.no_grad():
@@ -218,29 +280,29 @@ def validate_reconstruction(model, val_loader, diff_params, device):
             sr_eeg = reconstruct_eeg_fixed(model, x_lr, diff_params, device, steps=50)
             
             sr_np = sr_eeg.cpu().numpy()
-            hr_np = y_sr.cpu().numpy()
+            sr_gt = y_sr.cpu().numpy()
             
             # Align length
-            min_len = min(sr_np.shape[2], hr_np.shape[2])
+            min_len = min(sr_np.shape[2], sr_gt.shape[2])
             sr_np = sr_np[:, :, :min_len]
-            hr_np = hr_np[:, :, :min_len]
+            sr_gt = sr_gt[:, :, :min_len]
             
             # Channel-wise PCC (most important metric)
             for b in range(sr_np.shape[0]):
                 for ch in range(sr_np.shape[1]):
                     sr_sig = sr_np[b, ch]
-                    hr_sig = hr_np[b, ch]
+                    sr_sig_gt = sr_gt[b, ch]
                     
-                    if np.std(sr_sig) > 1e-6 and np.std(hr_sig) > 1e-6:
-                        pcc = np.corrcoef(sr_sig, hr_sig)[0, 1]
+                    if np.std(sr_sig) > 1e-6 and np.std(sr_sig_gt) > 1e-6:
+                        pcc = np.corrcoef(sr_sig, sr_sig_gt)[0, 1]
                         if not np.isnan(pcc):
                             metrics['PCC'].append(pcc)
             
             # Other metrics
-            mse = np.mean((sr_np - hr_np) ** 2)
-            nmse = mse / (np.mean(hr_np ** 2) + 1e-10)
-            snr = 10 * np.log10((np.mean(hr_np ** 2) + 1e-10) / (mse + 1e-10))
-            mae = np.mean(np.abs(sr_np - hr_np))
+            mse = np.mean((sr_np - sr_gt) ** 2)
+            nmse = mse / (np.mean(sr_gt ** 2) + 1e-10)
+            snr = 10 * np.log10((np.mean(sr_gt ** 2) + 1e-10) / (mse + 1e-10))
+            mae = np.mean(np.abs(sr_np - sr_gt))
             
             metrics['NMSE'].append(nmse)
             metrics['SNR'].append(snr)
@@ -367,12 +429,12 @@ class STAD(nn.Module):
         patch_size = mae_patch_size
         num_patches = seq_len // patch_size
         
-        # MAE (embed_dim=256)
+        # ✅ FIX: MAE in_chans must match pretrained checkpoint (hr_channels=16, not sr_channels=32)
         self.mae = MAEforEEG(
             time_len=seq_len,
             patch_size=patch_size,
             embed_dim=latent_dim,
-            in_chans=sr_channels,
+            in_chans=hr_channels,  # ✅ 16 to match pretrained MAE
             depth=mae_depth,
             num_heads=mae_num_heads,
             decoder_embed_dim=mae_decoder_embed_dim,
@@ -388,7 +450,7 @@ class STAD(nn.Module):
             seq_len, 
             embed_dim=latent_dim,  # ✅ 256 to match MAE
             n_harmonics=n_harmonics, 
-            patch_size=16,
+            patch_size=patch_size,  # ✅ Use same patch_size as MAE (8), not hard-coded 16
             n_transformer_layers=4,
             n_heads=8
         )
@@ -400,6 +462,13 @@ class STAD(nn.Module):
             n_layers=6,
             n_heads=16
         )
+        # SEED4-style direct SR supervision head from decoded HR waveform.
+        self.sr_head = nn.Conv1d(hr_channels, sr_channels, kernel_size=1, bias=True)
+        with torch.no_grad():
+            self.sr_head.weight.zero_()
+            self.sr_head.bias.zero_()
+            for i in range(min(hr_channels, sr_channels // 2)):
+                self.sr_head.weight[2 * i, i, 0] = 1.0
         
         self.latent_dim = latent_dim
         self.num_patches = num_patches
@@ -437,6 +506,18 @@ class STAD(nn.Module):
         # Don't normalize - diffusion models work better with unnormalized latents
         # The noise epsilon is sampled from N(0, 1) and should match the latent scale
         return latent
+
+    def latent_to_hr(self, latent_no_cls):
+        cls_token = self.mae.cls_token.expand(latent_no_cls.shape[0], -1, -1)
+        latent_with_cls = torch.cat([cls_token, latent_no_cls], dim=1)
+        pred_patches = self.mae_decode_full(latent_with_cls)
+        hr_eeg = self.mae.unpatchify(pred_patches)
+        return torch.nan_to_num(hr_eeg, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def latent_to_sr(self, latent_no_cls):
+        hr_eeg = self.latent_to_hr(latent_no_cls)
+        sr_eeg = self.sr_head(hr_eeg)
+        return torch.nan_to_num(sr_eeg, nan=0.0, posinf=0.0, neginf=0.0)
     
     def forward(self, lr_eeg, zt, t_steps, lr_chan_pos):
         cond_tokens, cond_pooled = self.stc(lr_eeg, lr_chan_pos, t_steps)
@@ -451,9 +532,19 @@ def train_stad_fixed(
     mae_fold=None,
     require_full_mae_latent=True,
     prc_root_dir=None,
+    lambda_eps=1.0,
+    lambda_recon=0.05,
+    lambda_signal=1.0,  # ✅ Default increased; properly normalized signal loss
+    adaptive_gradnorm=True,
+    gradnorm_eta=0.005,
+    sr_loss_weight=1.0,
+    resume_stad_checkpoint='',
+    resume_optimizer=False,
+    save_optimizer_state=False,
 ):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"🚀 STAD Training (DIMENSION FIXED)")
+    selected_fold = None
 
     # Paper-style setup: LR=8, HR=16, SR=32.
     hr_channels = 16
@@ -472,6 +563,7 @@ def train_stad_fixed(
 
     if mae_results_dir is not None and os.path.isdir(mae_results_dir):
         ckpt_path, selected = _resolve_best_kfold_checkpoint(mae_results_dir, preferred_fold=mae_fold)
+        selected_fold = selected.get('fold')
         ckpt_preview = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         cfg = ckpt_preview.get('config', {})
 
@@ -506,6 +598,7 @@ def train_stad_fixed(
         if mae_results_dir is None:
             raise ValueError("mae_results_dir is required when using prc_root_dir for fold-aware subject split.")
         fold_used, train_subjects, val_subjects = _resolve_fold_subject_split(mae_results_dir, preferred_fold=mae_fold)
+        selected_fold = fold_used
         print(f"📌 Fold {fold_used} subject split from pretrained results")
         print(f"   Train subjects ({len(train_subjects)}): {train_subjects}")
         print(f"   Val subjects ({len(val_subjects)}): {val_subjects}")
@@ -601,13 +694,89 @@ def train_stad_fixed(
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, num_epochs)
     criterion = nn.MSELoss()
+    recon_criterion = nn.L1Loss()
+    signal_criterion = nn.L1Loss()  # L1 is more stable than MSE for signal-level
     scaler = GradScaler('cuda')
+
+    dataset_tag = 'prcoutput' if prc_root_dir is not None else 'deap'
+    fold_tag = f"_fold{selected_fold}" if selected_fold is not None else ""
+    best_ckpt_name = f"best_stad_{dataset_tag}{fold_tag}.pt"
+    latest_ckpt_name = f"latest_stad_{dataset_tag}{fold_tag}.pt"
+    preferred_save_root = os.environ.get('STAD_SAVE_DIR', '').strip()
+    if preferred_save_root:
+        ckpt_root = preferred_save_root
+    else:
+        cwd_free_gb = shutil.disk_usage(os.getcwd()).free / (1024 ** 3)
+        ckpt_root = os.getcwd() if cwd_free_gb >= 3.0 else '/tmp/EEG-MTP/New_DEAP_checkpoints'
+    os.makedirs(ckpt_root, exist_ok=True)
+    best_ckpt_path = os.path.join(ckpt_root, best_ckpt_name)
+    latest_ckpt_path = os.path.join(ckpt_root, latest_ckpt_name)
+    print(f"💾 Best checkpoint filename: {best_ckpt_name}")
+    print(f"💾 Latest checkpoint filename: {latest_ckpt_name}")
+    print(f"📁 Checkpoint directory: {ckpt_root}")
+    print(f"⚖️  Loss weights: lambda_eps={lambda_eps}, lambda_recon={lambda_recon}, lambda_signal={lambda_signal}")
+    print(f"⚖️  SR supervision weight: {sr_loss_weight}")
+    print(f"🧭 Adaptive GradNorm: {adaptive_gradnorm} (eta={gradnorm_eta})")
+
+    ref_param = next((p for p in model.mtd.parameters() if p.requires_grad), None)
+    ema_g_eps = None
+    ema_g_rec = None
+    ema_g_sig = None
+    gradnorm_beta = 0.9
+    lambda_min = 1e-4
+    lambda_max_aux = 0.2
+    lambda_aux_budget = 0.2
     
     best_val_loss = float('inf')
+    start_epoch = 0
+    mae_unfrozen = False
+
+    if resume_stad_checkpoint:
+        resume_path = resume_stad_checkpoint
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        payload = torch.load(resume_path, map_location=device, weights_only=False)
+        model_state = payload.get('model')
+        if model_state is None:
+            raise KeyError(f"Resume checkpoint missing 'model': {resume_path}")
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
+        if missing:
+            print(f"⚠️  Missing keys while resuming: {len(missing)}")
+        if unexpected:
+            print(f"⚠️  Unexpected keys while resuming: {len(unexpected)}")
+
+        start_epoch = int(payload.get('epoch', 0))
+        best_val_loss = float(payload.get('best_val_loss', payload.get('val_loss', float('inf'))))
+        lambda_recon = float(payload.get('lambda_recon', lambda_recon))
+        lambda_signal = float(payload.get('lambda_signal', lambda_signal))
+
+        if resume_optimizer and 'optimizer_state_dict' in payload:
+            try:
+                optimizer.load_state_dict(payload['optimizer_state_dict'])
+            except Exception as e:
+                print(f"⚠️  Could not load optimizer state: {e}")
+        if resume_optimizer and 'scheduler_state_dict' in payload:
+            try:
+                scheduler.load_state_dict(payload['scheduler_state_dict'])
+            except Exception as e:
+                print(f"⚠️  Could not load scheduler state: {e}")
+        if resume_optimizer and 'scaler_state_dict' in payload:
+            try:
+                scaler.load_state_dict(payload['scaler_state_dict'])
+            except Exception as e:
+                print(f"⚠️  Could not load scaler state: {e}")
+
+        print(f"🔁 Resumed STAD from: {resume_path}")
+        print(f"   Starting epoch: {start_epoch + 1}/{num_epochs}")
+        print(f"   Best val loss so far: {best_val_loss:.6f}")
+
+    if start_epoch >= num_epochs:
+        print(f"✓ Resume checkpoint already at epoch {start_epoch}; nothing to train.")
+        return
     
-    for epoch in range(num_epochs):
-        # Unfreeze MAE after 50 epochs
-        if epoch == 50:
+    for epoch in range(start_epoch, num_epochs):
+        # Unfreeze MAE after 50 epochs (also works for resumed runs after epoch 50).
+        if (not mae_unfrozen) and (epoch >= 50):
             print("\n🔓 Unfreezing MAE for fine-tuning")
             for p in model.mae.parameters():
                 p.requires_grad = True
@@ -617,10 +786,14 @@ def train_stad_fixed(
                 weight_decay=0.05
             )
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, num_epochs - epoch)
+            mae_unfrozen = True
         
         # Train
         model.train()
         train_loss = 0.0
+        train_eps_loss = 0.0
+        train_recon_loss = 0.0
+        train_signal_loss = 0.0
         
         for x_lr, y_hr, y_sr in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             x_lr, y_hr, y_sr = x_lr.to(device), y_hr.to(device), y_sr.to(device)
@@ -629,8 +802,8 @@ def train_stad_fixed(
             optimizer.zero_grad(set_to_none=True)
             
             with autocast('cuda', dtype=torch.float16):
-                # Diffusion target is SR latent (paper-style latent SR path)
-                z0 = model.encode_hr(y_sr)
+                # ✅ FIX: Encode HR not SR - MAE was trained on HR (16ch) not SR (32ch)
+                z0 = model.encode_hr(y_hr)
                 
                 # Sample timestep and noise
                 t = torch.randint(0, T, (B,), device=device)
@@ -646,9 +819,58 @@ def train_stad_fixed(
                 
                 # Predict noise
                 pred_epsilon = model(x_lr, zt, t, lr_pos)
-                
-                # Loss
-                loss = criterion(pred_epsilon, epsilon)
+
+                # Primary diffusion loss
+                eps_loss = criterion(pred_epsilon, epsilon)
+
+                # Direct latent reconstruction target from predicted epsilon
+                safe_sqrt_alpha = torch.clamp(sqrt_alpha, min=1e-3)
+                pred_z0 = (zt - sqrt_one_minus * pred_epsilon) / safe_sqrt_alpha
+                recon_loss = recon_criterion(pred_z0, z0)
+                # Normalize by latent dimension to match epsilon scale (~1-2)
+                recon_loss = recon_loss / (model.latent_dim + 1e-8)
+
+                # SEED4-style direct SR supervision.
+                pred_z0_decode = torch.clamp(pred_z0, min=-10.0, max=10.0)
+                pred_sr_eeg = model.latent_to_sr(pred_z0_decode)
+                signal_loss = signal_criterion(pred_sr_eeg, y_sr)
+                signal_loss = signal_loss / (model.sr_channels * x_lr.shape[2] + 1e-8)
+                signal_loss = torch.nan_to_num(signal_loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+                if adaptive_gradnorm and ref_param is not None:
+                    g_eps = torch.autograd.grad(eps_loss, ref_param, retain_graph=True, allow_unused=True)[0]
+                    g_rec = torch.autograd.grad(recon_loss, ref_param, retain_graph=True, allow_unused=True)[0]
+                    g_sig = torch.autograd.grad(signal_loss, ref_param, retain_graph=True, allow_unused=True)[0]
+
+                    g_eps_n = float(g_eps.norm().item()) if g_eps is not None else 0.0
+                    g_rec_n = float(g_rec.norm().item()) if g_rec is not None else 0.0
+                    g_sig_n = float(g_sig.norm().item()) if g_sig is not None else 0.0
+
+                    if np.isfinite(g_eps_n) and g_eps_n > 0.0:
+                        if ema_g_eps is None:
+                            ema_g_eps, ema_g_rec, ema_g_sig = g_eps_n, g_rec_n, g_sig_n
+                        else:
+                            ema_g_eps = (gradnorm_beta * ema_g_eps) + ((1.0 - gradnorm_beta) * g_eps_n)
+                            ema_g_rec = (gradnorm_beta * ema_g_rec) + ((1.0 - gradnorm_beta) * g_rec_n)
+                            ema_g_sig = (gradnorm_beta * ema_g_sig) + ((1.0 - gradnorm_beta) * g_sig_n)
+
+                        if ema_g_rec is not None and ema_g_rec > 0.0 and np.isfinite(ema_g_rec):
+                            ratio_rec = ema_g_eps / (ema_g_rec + 1e-8)
+                            lambda_recon = float(np.clip(lambda_recon * (ratio_rec ** gradnorm_eta), lambda_min, lambda_max_aux))
+                        if ema_g_sig is not None and ema_g_sig > 0.0 and np.isfinite(ema_g_sig):
+                            ratio_sig = ema_g_eps / (ema_g_sig + 1e-8)
+                            lambda_signal = float(np.clip(lambda_signal * (ratio_sig ** gradnorm_eta), lambda_min, lambda_max_aux))
+
+                        # Keep epsilon dominant by constraining total auxiliary weight.
+                        aux_sum = lambda_recon + lambda_signal
+                        if aux_sum > lambda_aux_budget:
+                            scale = lambda_aux_budget / (aux_sum + 1e-8)
+                            lambda_recon = max(lambda_min, lambda_recon * scale)
+                            lambda_signal = max(lambda_min, lambda_signal * scale)
+
+                # Balanced multi-objective
+                loss = (lambda_eps * eps_loss) + (lambda_recon * recon_loss) + (sr_loss_weight * lambda_signal * signal_loss)
+                loss = torch.nan_to_num(loss, nan=eps_loss.detach(), posinf=eps_loss.detach(), neginf=eps_loss.detach())
             
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -657,18 +879,30 @@ def train_stad_fixed(
             scaler.update()
             
             train_loss += loss.item()
+            train_eps_loss += eps_loss.item()
+            train_recon_loss += recon_loss.item()
+            train_signal_loss += signal_loss.item()
         
         train_loss /= len(train_loader)
+        train_eps_loss /= len(train_loader)
+        train_recon_loss /= len(train_loader)
+        train_signal_loss /= len(train_loader)
         
         # Validation
         model.eval()
         val_loss = 0.0
+        val_eps_loss = 0.0
+        val_recon_loss = 0.0
+        val_signal_loss = 0.0
+        val_pcc = []
+        val_nmse = []
+        val_snr = []
         with torch.no_grad():
             for x_lr, y_hr, y_sr in val_loader:
                 x_lr, y_hr, y_sr = x_lr.to(device), y_hr.to(device), y_sr.to(device)
                 B = x_lr.size(0)
                 
-                z0 = model.encode_hr(y_sr)
+                z0 = model.encode_hr(y_hr)  # ✅ Encode HR (16ch) to match MAE training
                 t = torch.randint(0, T, (B,), device=device)
                 epsilon = torch.randn_like(z0)
                 
@@ -678,12 +912,49 @@ def train_stad_fixed(
                 
                 lr_pos = get_channel_positions(model.lr_channels, device, B)
                 pred_epsilon = model(x_lr, zt, t, lr_pos)
-                val_loss += criterion(pred_epsilon, epsilon).item()
+
+                eps_loss = criterion(pred_epsilon, epsilon)
+                safe_sqrt_alpha = torch.clamp(sqrt_alpha, min=1e-3)
+                pred_z0 = (zt - sqrt_one_minus * pred_epsilon) / safe_sqrt_alpha
+                recon_loss = recon_criterion(pred_z0, z0)
+                # Normalize by latent dimension to match epsilon scale (~1-2)
+                recon_loss = recon_loss / (model.latent_dim + 1e-8)
+                
+                pred_z0_decode = torch.clamp(pred_z0, min=-10.0, max=10.0)
+                pred_sr_eeg = model.latent_to_sr(pred_z0_decode)
+                signal_loss = signal_criterion(pred_sr_eeg, y_sr)
+                signal_loss = signal_loss / (model.sr_channels * x_lr.shape[2] + 1e-8)
+                signal_loss = torch.nan_to_num(signal_loss, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                total_loss = (lambda_eps * eps_loss) + (lambda_recon * recon_loss) + (sr_loss_weight * lambda_signal * signal_loss)
+                total_loss = torch.nan_to_num(total_loss, nan=eps_loss.detach(), posinf=eps_loss.detach(), neginf=eps_loss.detach())
+
+                sr_metrics = compute_sr_metrics_torch(pred_sr_eeg.float(), y_sr.float())
+                val_pcc.append(sr_metrics['PCC'])
+                val_nmse.append(sr_metrics['NMSE'])
+                val_snr.append(sr_metrics['SNR'])
+
+                val_loss += total_loss.item()
+                val_eps_loss += eps_loss.item()
+                val_recon_loss += recon_loss.item()
+                val_signal_loss += signal_loss.item()
         
         val_loss /= len(val_loader)
+        val_eps_loss /= len(val_loader)
+        val_recon_loss /= len(val_loader)
+        val_signal_loss /= len(val_loader)
+        mean_pcc = float(np.mean(val_pcc)) if val_pcc else 0.0
+        mean_nmse = float(np.mean(val_nmse)) if val_nmse else float('inf')
+        mean_snr = float(np.mean(val_snr)) if val_snr else -float('inf')
         scheduler.step()
         
-        print(f"Epoch {epoch+1}/{num_epochs} | Train: {train_loss:.6f} | Val: {val_loss:.6f}")
+        print(
+            f"Epoch {epoch+1}/{num_epochs} | "
+            f"Train: {train_loss:.6f} (eps={train_eps_loss:.6f}, rec={train_recon_loss:.6f}, sig={train_signal_loss:.6f}) | "
+            f"Val: {val_loss:.6f} (eps={val_eps_loss:.6f}, rec={val_recon_loss:.6f}, sig={val_signal_loss:.6f}) | "
+            f"PCC={mean_pcc:.4f}, NMSE={mean_nmse:.4f}, SNR={mean_snr:.2f}dB"
+        )
+        print(f"   lambdas -> eps={lambda_eps:.4f}, rec={lambda_recon:.4f}, sig={lambda_signal:.4f}")
         
         # Check if loss is in expected range
         if epoch > 10:
@@ -692,23 +963,53 @@ def train_stad_fixed(
             elif train_loss > 2.0:
                 print("⚠️  WARNING: Loss very high - possible gradient issues!")
         
-        # Reconstruction metrics every 5 epochs
-        if (epoch + 1) % 5 == 0:
-            metrics = validate_reconstruction(model, val_loader, diff_params, device)
-            print(f"📊 RECON: PCC={metrics['PCC']:.3f}, SNR={metrics['SNR']:.1f}dB, NMSE={metrics['NMSE']:.4f}")
+        def _build_ckpt_payload(epoch_idx):
+            payload = {
+                'model': model.state_dict(),
+                'epoch': epoch_idx + 1,
+                'best_val_loss': best_val_loss,
+                'val_loss': val_loss,
+                'val_eps_loss': val_eps_loss,
+                'val_recon_loss': val_recon_loss,
+                'val_signal_loss': val_signal_loss,
+                'val_pcc': mean_pcc,
+                'val_nmse': mean_nmse,
+                'val_snr_db': mean_snr,
+                'train_loss': train_loss,
+                'train_eps_loss': train_eps_loss,
+                'train_recon_loss': train_recon_loss,
+                'train_signal_loss': train_signal_loss,
+                'lambda_eps': lambda_eps,
+                'lambda_recon': lambda_recon,
+                'lambda_signal': lambda_signal,
+                'sr_loss_weight': sr_loss_weight,
+                'diff_params': diff_params,
+            }
+            if save_optimizer_state:
+                payload['optimizer_state_dict'] = optimizer.state_dict()
+                payload['scheduler_state_dict'] = scheduler.state_dict()
+                payload['scaler_state_dict'] = scaler.state_dict()
+            return payload
         
         # Save best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save({
-                'model': model.state_dict(), 
-                'epoch': epoch, 
-                'val_loss': val_loss,
-                'diff_params': diff_params
-            }, 'best_stad_DIMENSION_FIXED2.pt')
-            print(f"✅ SAVED (val={val_loss:.6f})")
-    
-    print(f"\n🎉 Training complete! Best: {best_val_loss:.6f}")
+            saved_ok, saved_path, saved_kind = _safe_save_checkpoint(_build_ckpt_payload(epoch), best_ckpt_path)
+            if saved_ok:
+                print(f"✅ SAVED [{saved_kind}] (val={val_loss:.6f}) -> {saved_path}")
+            else:
+                print(f"⚠️  Could not save checkpoint this epoch (val={val_loss:.6f}); training will continue.")
+
+        latest_ok, latest_path, latest_kind = _safe_save_checkpoint(_build_ckpt_payload(epoch), latest_ckpt_path)
+        if not latest_ok:
+            print(f"⚠️  Could not save latest checkpoint at epoch {epoch+1}.")
+        else:
+            print(f"📝 LATEST [{latest_kind}] -> {latest_path}")
+
+    print(f"\n🎉 Training complete! Best val loss: {best_val_loss:.6f}")
+    print(f"💾 Final checkpoint target: {best_ckpt_path}")
+    print(f"💾 Final latest checkpoint: {latest_ckpt_path}")
+
 
 if __name__ == '__main__':
     train_stad_fixed(
@@ -719,4 +1020,9 @@ if __name__ == '__main__':
         mae_results_dir='/home/ab_students/EEG-MTP/trial_mae_DEAP/results_kfold_prcoutput_mask75_val75_even16',
         require_full_mae_latent=False,
         prc_root_dir='/DATA/EEG-MTP/DEAP-PrC_final',
+        lambda_signal=1.0,
+        sr_loss_weight=0.5,
+        resume_stad_checkpoint='',
+        resume_optimizer=False,
+        save_optimizer_state=False,
     )

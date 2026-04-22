@@ -9,7 +9,6 @@ Updated to work with patch-based latents (B, num_patches, dim) instead of channe
 import torch
 import torch.nn as nn
 import numpy as np
-import torch.nn.functional as F
 
 def sinusoidal_embedding(timesteps, dim):
     """Sinusoidal positional encoding for diffusion timesteps"""
@@ -33,33 +32,37 @@ class MultiScaleTransformerDenoisingModule(nn.Module):
         n_layers: Number of transformer layers
         n_heads: Number of attention heads
         dropout: Dropout rate
+        use_multiscale_conv: Whether to use multi-scale 1D convolutions (STAD paper)
     """
     def __init__(
         self,
         num_patches=100,      # ✅ Changed from hr_channels
         latent_dim=256,       # ✅ Increased from 128
+        cond_dim=None,
         n_layers=6,
         n_heads=16,
         dropout=0.1,
-        kernel_sizes=(3, 5, 7, 9),
+        use_multiscale_conv=True,  # STAD paper feature
     ):
         super().__init__()
         self.num_patches = num_patches
         self.latent_dim = latent_dim
+        self.cond_dim = cond_dim if cond_dim is not None else latent_dim
         self.n_heads = n_heads
-
-        # Multi-scale temporal conv path (STAD-style): k=3,5,7,9
-        self.ms_convs = nn.ModuleList([
-            nn.Conv1d(latent_dim, latent_dim, kernel_size=k, padding=k // 2)
-            for k in kernel_sizes
-        ])
-        self.ms_bns = nn.ModuleList([
-            nn.BatchNorm1d(latent_dim) for _ in kernel_sizes
-        ])
-        self.ms_fuse = nn.Sequential(
-            nn.Linear(latent_dim * len(kernel_sizes), latent_dim),
-            nn.LayerNorm(latent_dim),
-        )
+        self.use_multiscale_conv = use_multiscale_conv
+        
+        # ✅ Multi-scale 1D convolutions (STAD paper Section III.C.3)
+        if use_multiscale_conv:
+            self.kernel_sizes = [3, 5, 7, 9]
+            self.conv_layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv1d(latent_dim, latent_dim, kernel_size=k, padding=k//2),
+                    nn.BatchNorm1d(latent_dim)
+                )
+                for k in self.kernel_sizes
+            ])
+            # Project concatenated features back to latent_dim
+            self.conv_proj = nn.Linear(latent_dim * len(self.kernel_sizes), latent_dim)
         
         # ✅ Positional embedding for PATCHES (not channels)
         self.pos_embed = nn.Parameter(
@@ -103,6 +106,12 @@ class MultiScaleTransformerDenoisingModule(nn.Module):
         ])
         self.norm_self = nn.LayerNorm(latent_dim)
         
+        # Conditioning projection is fixed at init for reproducibility.
+        if self.cond_dim != self.latent_dim:
+            self.cond_proj = nn.Linear(self.cond_dim, self.latent_dim)
+        else:
+            self.cond_proj = nn.Identity()
+        
         # Final projection (optional, can help with stability)
         self.output_proj = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
@@ -127,17 +136,34 @@ class MultiScaleTransformerDenoisingModule(nn.Module):
         assert D == self.latent_dim, f"Expected latent_dim={self.latent_dim}, got {D}"
         
         # ============================================================
-        # 1. Multi-scale temporal conv features
+        # 1. Multi-Scale 1D Convolutions (STAD Paper Eq. 3)
         # ============================================================
-        z_seq = zt.transpose(1, 2)  # (B, latent_dim, num_patches)
-        ms_feats = []
-        for conv, bn in zip(self.ms_convs, self.ms_bns):
-            ms_feats.append(F.relu(bn(conv(z_seq))))
-        ms_concat = torch.cat(ms_feats, dim=1).transpose(1, 2)  # (B, N, latent_dim * n_scales)
-        x = self.ms_fuse(ms_concat) + self.pos_embed
+        if self.use_multiscale_conv:
+            # Transpose for Conv1d: (B, latent_dim, num_patches)
+            zt_conv = zt.transpose(1, 2)  # (B, D, N)
+            
+            # Apply convolutions with different kernel sizes
+            conv_outputs = []
+            for conv_layer in self.conv_layers:
+                h_i = conv_layer(zt_conv)  # (B, D, N)
+                conv_outputs.append(h_i)
+            
+            # Concatenate along feature dimension
+            h_concat = torch.cat(conv_outputs, dim=1)  # (B, D*4, N)
+            h_concat = h_concat.transpose(1, 2)  # (B, N, D*4)
+            
+            # Project back to latent_dim
+            x = self.conv_proj(h_concat)  # (B, N, D)
+        else:
+            x = zt
         
         # ============================================================
-        # 2. Add Timestep Embedding
+        # 2. Add Positional Encoding
+        # ============================================================
+        x = x + self.pos_embed  # (B, num_patches, latent_dim)
+        
+        # ============================================================
+        # 3. Add Timestep Embedding
         # ============================================================
         t_emb = sinusoidal_embedding(t_steps, self.latent_dim)  # (B, latent_dim)
         t_emb = self.time_mlp(t_emb)  # (B, latent_dim)
@@ -145,23 +171,18 @@ class MultiScaleTransformerDenoisingModule(nn.Module):
         # Expand to all patches
         t_emb = t_emb.unsqueeze(1).expand(-1, self.num_patches, -1)  # (B, num_patches, latent_dim)
         x = x + t_emb
-
-        # Inject global LR context from STC pooled token.
-        if cond_pooled is not None:
-            x = x + cond_pooled.unsqueeze(1)
         
         # ============================================================
-        # 3. Cross-Attention with LR Conditioning
+        # 4. Cross-Attention with LR Conditioning (STAD Paper Eq. 5)
         # ============================================================
         # cond_tokens: (B, lr_channels, embed_dim)
         # We need to match dimensions if embed_dim != latent_dim
         
-        # If dimensions don't match, project conditioning
-        if cond_tokens.shape[-1] != self.latent_dim:
-            # Add a projection layer (define in __init__ if needed)
-            if not hasattr(self, 'cond_proj'):
-                self.cond_proj = nn.Linear(cond_tokens.shape[-1], self.latent_dim).to(cond_tokens.device)
-            cond_tokens = self.cond_proj(cond_tokens)
+        if cond_tokens.shape[-1] != self.cond_dim:
+            raise ValueError(
+                f"Expected cond_tokens last dim={self.cond_dim}, got {cond_tokens.shape[-1]}"
+            )
+        cond_tokens = self.cond_proj(cond_tokens)
         
         # Apply cross-attention layers
         for i, (cross_attn, norm) in enumerate(zip(self.cross_attn_layers, self.norm_cross)):
@@ -174,13 +195,13 @@ class MultiScaleTransformerDenoisingModule(nn.Module):
             x = norm(x + x_attended)  # Residual connection + norm
         
         # ============================================================
-        # 4. Self-Attention Denoising
+        # 5. Self-Attention Denoising (MSA - STAD Paper Eq. 4)
         # ============================================================
         x = self.transformer(x)  # (B, num_patches, latent_dim)
         x = self.norm_self(x)
         
         # ============================================================
-        # 5. Output Projection
+        # 6. Output Projection (Predict Noise)
         # ============================================================
         pred_noise = self.output_proj(x)  # (B, num_patches, latent_dim)
         

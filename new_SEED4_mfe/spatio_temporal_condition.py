@@ -69,16 +69,9 @@ def compute_graph_harmonics(chan_pos, k=8, n_neighbors=4):
     
     # Take first k+1 eigenvectors (skip the constant first one)
     # These are the "harmonic" basis functions on the electrode graph
-    max_k = max(1, C - 1)
-    use_k = min(k, max_k)
-    basis = eigenvectors[:, 1:use_k + 1]  # (C, use_k)
-
-    # Keep output width fixed at requested k so downstream Linear(k -> embed_dim) is stable.
-    if use_k < k:
-        pad = np.zeros((C, k - use_k), dtype=basis.dtype)
-        basis = np.concatenate([basis, pad], axis=1)
-    elif use_k > k:
-        basis = basis[:, :k]
+    if k + 1 > C:
+        k = C - 1
+    basis = eigenvectors[:, 1:k+1]  # (C, k)
     
     return torch.tensor(basis, dtype=torch.float32)
 
@@ -190,26 +183,37 @@ class SpatioTemporalConditionModule(nn.Module):
     
     def forward(self, x, chan_pos, t_steps):
         B, C, T = x.shape
-
-        # 1. Per-channel temporal patching preserves channel-specific dynamics.
         n_patches = T // self.patch_size
-        if n_patches < 1:
-            raise ValueError(f"Input length T={T} is smaller than patch_size={self.patch_size}")
-
         usable_len = n_patches * self.patch_size
-        x_trim = x[:, :, :usable_len]
-        x_patches = x_trim.reshape(B, C, n_patches, self.patch_size)
-        temporal_feat = self.patch_embed(x_patches)
-        temporal_feat = temporal_feat + self.pos_embed[:, :C, :n_patches, :]
+
+        if n_patches != self.n_patches:
+            raise ValueError(
+                f"Expected {self.n_patches} temporal patches from seq_len={self.seq_len}, "
+                f"but got {n_patches} patches from input length T={T}."
+            )
+        if usable_len != T:
+            # Keep full patches only; avoids shape drift when T is not divisible by patch_size.
+            x = x[:, :, :usable_len]
         
-        # 2. Spatial (unchanged)
+        # 1) Patch-wise temporal embedding (paper-aligned tokenization by channel and patch)
+        x_patches = x.reshape(B, C, n_patches, self.patch_size)  # (B, C, N, patch_size)
+        temporal_tokens = self.patch_embed(x_patches)  # (B, C, N, embed_dim)
+
+        # 2) Temporal convolution context (local temporal patterns), projected to patch tokens
+        x_conv = self.temporal_conv(x)  # (B, embed_dim, T)
+        x_conv = x_conv.reshape(B, self.embed_dim, n_patches, self.patch_size).mean(dim=-1)
+        x_conv = x_conv.permute(0, 2, 1).unsqueeze(1).expand(-1, C, -1, -1)  # (B, C, N, embed_dim)
+
+        temporal_feat = temporal_tokens + x_conv + self.pos_embed
+        
+        # 3. Spatial (unchanged)
         harmonics = self._compute_harmonics_if_needed(chan_pos)
         spatial_feat = self.harmonic_proj(harmonics).unsqueeze(0).unsqueeze(2).expand(B, -1, n_patches, -1)
         
-        # 3. Time embedding (unchanged)
+        # 4. Time embedding (unchanged)
         t_emb = self.time_mlp(sinusoidal_embedding(t_steps, self.embed_dim)).unsqueeze(1).unsqueeze(2).expand(-1, C, n_patches, -1)
         
-        # 4. Fusion + Transformer (unchanged)
+        # 5. Fusion + Transformer (unchanged)
         fused_feat = temporal_feat + spatial_feat + t_emb
         fused_flat = fused_feat.reshape(B, C * n_patches, self.embed_dim)
         cond_flat = self.transformer(fused_flat)
