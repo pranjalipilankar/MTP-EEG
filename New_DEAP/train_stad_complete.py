@@ -14,6 +14,7 @@ import json
 import sys
 import shutil
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.checkpoint import checkpoint
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 from scipy.signal import butter, filtfilt
@@ -469,6 +470,8 @@ class STAD(nn.Module):
             self.sr_head.bias.zero_()
             for i in range(min(hr_channels, sr_channels // 2)):
                 self.sr_head.weight[2 * i, i, 0] = 1.0
+
+        self.use_mae_checkpointing = True
         
         self.latent_dim = latent_dim
         self.num_patches = num_patches
@@ -493,7 +496,10 @@ class STAD(nn.Module):
         x = self.mae.decoder_embed(encoded_with_cls)
         x = x + self.mae.decoder_pos_embed
         for blk in self.mae.decoder_blocks:
-            x = blk(x)
+            if self.use_mae_checkpointing and self.training and x.requires_grad:
+                x = checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
         x = self.mae.decoder_norm(x)
         x = self.mae.decoder_pred(x)
         return x[:, 1:, :]
@@ -803,7 +809,8 @@ def train_stad_fixed(
             
             with autocast('cuda', dtype=torch.float16):
                 # ✅ FIX: Encode HR not SR - MAE was trained on HR (16ch) not SR (32ch)
-                z0 = model.encode_hr(y_hr)
+                with torch.no_grad():
+                    z0 = model.encode_hr(y_hr)
                 
                 # Sample timestep and noise
                 t = torch.randint(0, T, (B,), device=device)
