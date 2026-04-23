@@ -311,11 +311,19 @@ def train_with_monitoring(model, train_loader, val_loader, optimizer, loss_scale
 def main():
     """Main training function"""
     parser = argparse.ArgumentParser(description='Train MAE on Localize-MI 128-channel data')
-    parser.add_argument('--data-path', default='/home/ab_students/EEG-MTP/DATA/Localize-MI/derivatives/epochs',
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    raw_default = os.path.join(project_root, 'DATA', 'Localize-MI', 'derivatives', 'epochs')
+    prc1_default = os.path.join(project_root, 'DATA', 'Localize-MI', 'derivatives', 'epochs_prc1')
+
+    parser.add_argument('--data-mode', default='raw', choices=['raw', 'prc1'],
+                        help='Data source mode: raw Localize-MI epochs or PrC-1 preprocessed outputs')
+    parser.add_argument('--data-path', default=None,
                         help='Path to Localize-MI dataset')
     parser.add_argument('--epochs', default=200, type=int, help='Number of epochs')
     parser.add_argument('--batch-size', default=32, type=int, help='Batch size')
     parser.add_argument('--lr', default=1e-3, type=float, help='Learning rate')
+    parser.add_argument('--output-dir', default=None,
+                        help='Output directory. If omitted, uses mode-specific default.')
     args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -324,15 +332,27 @@ def main():
     # Configuration
     # ============================================
     config = Config_MAE_LocalizeMI_128ch()
-    config.data_path = args.data_path
+    config.data_path = prc1_default if args.data_mode == 'prc1' else raw_default
+    if args.data_path is not None:
+        config.data_path = args.data_path
     config.num_epoch = args.epochs
     config.batch_size = args.batch_size
     config.lr = args.lr
+
+    if args.output_dir is not None:
+        config.output_path = args.output_dir
+    else:
+        mode_tag = 'prc1' if args.data_mode == 'prc1' else 'raw'
+        config.output_path = os.path.join(config.root_path, f'trial_mae_Localize-MI/results_128ch_{mode_tag}')
+
+    # Ensure output directory exists before any artifact write (e.g., split indices).
+    os.makedirs(config.output_path, exist_ok=True)
     
     print("="*60)
     print("Localize-MI 128-Channel MAE Training")
     print("="*60)
     print(f"Device: {device}")
+    print(f"Data mode: {args.data_mode}")
     print(f"Dataset: {config.data_path}")
     print(f"Channels: {config.original_channels} → {config.num_channels} (via EGI montage)")
     print(f"Epoch length: {config.time_len} samples ({config.time_len/config.sampling_rate*1000:.1f}ms @ {config.sampling_rate}Hz)")
@@ -369,6 +389,7 @@ def main():
     
     # Save split indices for downstream processing (e.g., STAD)
     split_file = os.path.join(config.output_path, 'dataset_split_indices.npz')
+    os.makedirs(os.path.dirname(split_file), exist_ok=True)
     np.savez(split_file, 
              train_indices=train_indices, 
              val_indices=val_indices, 

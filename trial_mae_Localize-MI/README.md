@@ -40,10 +40,21 @@ DATA/Localize-MI/derivatives/epochs/
 
 ## Usage
 
+### 1) Train on raw Localize-MI epochs
+
 ```bash
-cd /home/ab_students/EEG-MTP/trial_mae_Localize-MI
-python train_mae_localizemi.py
+cd /home/arnav-a5000/MTP-EEG/trial_mae_Localize-MI
+python train_mae_localizemi_128ch.py --data-mode raw
 ```
+
+### 2) Train on PrC-1 preprocessed Localize-MI output
+
+```bash
+cd /home/arnav-a5000/MTP-EEG/trial_mae_Localize-MI
+python train_mae_localizemi_128ch_kfold.py --data-mode prc1
+```
+
+You can override paths explicitly with `--data-path` in both scripts.
 
 ## Configuration
 

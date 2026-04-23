@@ -36,7 +36,7 @@ class Config_MAE_LocalizeMI_128ch:
         # ============================================
         # Localize-MI Dataset Parameters (128 channels)
         # ============================================
-        self.data_path = '/home/ab_students/EEG-MTP/DATA/Localize-MI/derivatives/epochs'
+        self.data_path = '/home/arnav-a5000/MTP-EEG/DATA/Localize-MI/derivatives/epochs_prc1'
         self.num_channels = 128     # Downsampled from 256 via EGI montage (every 2nd channel)
         self.time_len = 256         # 512ms @ 500Hz → 16 patches (better temporal context)
         self.sampling_rate = 500    # Sampling rate
@@ -62,7 +62,7 @@ class Config_MAE_LocalizeMI_128ch:
         # ============================================
         # Paths
         # ============================================
-        self.root_path = '/home/ab_students/EEG-MTP/'
+        self.root_path = '/home/arnav-a5000/MTP-EEG/'
         self.output_path = os.path.join(self.root_path, 'trial_mae_Localize-MI/results_128ch/')
         self.seed = 2024
         self.local_rank = 0

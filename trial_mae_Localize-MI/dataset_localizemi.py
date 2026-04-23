@@ -2,17 +2,17 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
-import glob
+import json
 from scipy import signal
 
 class LocalizeMIPretrainDataset(Dataset):
     """Dataset for MAE pretraining on Localize-MI HD-EEG dataset"""
     
-    def __init__(self, data_path, subjects='all', num_channels=256, time_len=2080, transform=None, 
+    def __init__(self, data_path, subjects='all', num_channels=256, time_len=2080, transform=None,
                  orig_fs=8000, target_fs=500):
         """
         Args:
-            data_path: Path to Localize-MI derivatives/epochs folder
+            data_path: Path to Localize-MI derivatives/epochs or derivatives/epochs_prc1 folder
             subjects: List of subject IDs (e.g., ['sub-01', 'sub-02']) or 'all'
             num_channels: Number of EEG channels (256 for Localize-MI)
             time_len: Fixed time length to use AFTER resampling (at target_fs)
@@ -28,12 +28,27 @@ class LocalizeMIPretrainDataset(Dataset):
         self.orig_fs = orig_fs
         self.target_fs = target_fs
         self.resample_factor = orig_fs / target_fs
+
+        data_root = Path(data_path)
+
+        # Mode 1: PrC-1 output layout (sub-XX/X_prc1.npy)
+        prc1_subject_dirs = sorted([p for p in data_root.glob('sub-*') if p.is_dir() and (p / 'X_prc1.npy').exists()])
+
+        if prc1_subject_dirs:
+            self._load_from_prc1(data_root, subjects)
+            self.epochs = np.array(self.epochs)
+            print(f"Loaded {len(self.epochs)} PrC-1 windows from {len(set(m['subject'] for m in self.metadata))} subjects")
+            print(f"Data shape per epoch: {self.epochs[0].shape}")
+            print(f"Duration per epoch: {self.time_len/self.target_fs*1000:.1f}ms @ {self.target_fs}Hz")
+            print(f"Value range: [{self.epochs.min():.6f}, {self.epochs.max():.6f}]")
+            return
         
+        # Mode 2: Raw derivatives/epochs layout (sub-XX/eeg/*_epochs.npy)
         # Determine which subjects to load
         if subjects == 'all':
-            subject_dirs = sorted(Path(data_path).glob('sub-*/eeg'))
+            subject_dirs = sorted(data_root.glob('sub-*/eeg'))
         else:
-            subject_dirs = [Path(data_path) / subj / 'eeg' for subj in subjects]
+            subject_dirs = [data_root / subj / 'eeg' for subj in subjects]
         
         # Load all epoch files
         print(f"Loading Localize-MI data...")
@@ -86,6 +101,64 @@ class LocalizeMIPretrainDataset(Dataset):
         print(f"Data shape per epoch: {self.epochs[0].shape}")
         print(f"Duration per epoch: {self.time_len/self.target_fs*1000:.1f}ms @ {self.target_fs}Hz")
         print(f"Value range: [{self.epochs.min():.6f}, {self.epochs.max():.6f}]")
+
+    def _load_from_prc1(self, data_root, subjects):
+        """Load subject-wise PrC-1 outputs while preserving source metadata."""
+        if subjects == 'all':
+            subject_dirs = sorted([p for p in data_root.glob('sub-*') if p.is_dir()])
+        else:
+            subject_dirs = [data_root / subj for subj in subjects]
+
+        self.epochs = []
+        self.metadata = []
+
+        print("Loading Localize-MI PrC-1 data...")
+
+        for subject_dir in subject_dirs:
+            x_path = subject_dir / 'X_prc1.npy'
+            if not x_path.exists():
+                continue
+
+            subject_id = subject_dir.name
+            x = np.load(x_path)  # (n_windows, C, T)
+
+            # Optional index file generated during preprocessing.
+            window_index_path = subject_dir / 'window_index.json'
+            if window_index_path.exists():
+                with open(window_index_path, 'r', encoding='utf-8') as f:
+                    window_index = json.load(f)
+            else:
+                window_index = None
+
+            for i in range(x.shape[0]):
+                epoch = x[i]
+
+                # PrC-1 path generally keeps fs/time length fixed, but keep consistent handling.
+                if self.resample_factor != 1.0:
+                    epoch = signal.resample_poly(epoch, up=self.target_fs, down=self.orig_fs, axis=1)
+
+                if epoch.shape[1] >= self.time_len:
+                    epoch_final = epoch[:, :self.time_len]
+                else:
+                    pad_width = ((0, 0), (0, self.time_len - epoch.shape[1]))
+                    epoch_final = np.pad(epoch, pad_width, mode='edge')
+
+                self.epochs.append(epoch_final)
+
+                meta = {
+                    'subject': subject_id,
+                    'run': '',
+                    'epoch_idx': int(i),
+                    'source_file': '',
+                    'source_epoch_idx': int(i),
+                }
+                if window_index is not None and i < len(window_index):
+                    entry = window_index[i]
+                    meta['source_file'] = entry.get('source_file', '')
+                    meta['source_epoch_idx'] = int(entry.get('epoch_index', i))
+                    meta['run'] = meta['source_file'].replace('_epochs.npy', '')
+
+                self.metadata.append(meta)
     
     def __len__(self):
         return len(self.epochs)
