@@ -267,13 +267,32 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
                     sr_loss = F.l1_loss(pred_sr.float(), sr_eeg.float())
                     
                     # CHANGED: Removed manual Z-score; MFE handles it
-                    mfe_loss = mfe_loss_fn(pred_sr.float(), sr_eeg.float().detach())
-                    
+                    mfe_loss = 0
+                    for ch in range(pred_sr.shape[1]):
+                        mfe_loss += mfe_loss_fn(
+                            pred_sr[:, ch:ch+1, :],
+                            sr_eeg[:, ch:ch+1, :].detach()
+                        )
+                    mfe_loss /= pred_sr.shape[1]
+                    mfe_loss = mfe_loss / (mfe_loss.detach().abs().mean() + 1e-6)
+                    if epoch < 20:
+                        mfe_weight = 0.0
+                    elif epoch < 50:
+                        mfe_weight = args.mfe_loss_weight * (epoch - 20) / 30
+                    else:
+                        mfe_weight = args.mfe_loss_weight
+                    mfe_loss = torch.clamp(mfe_loss, 0, 10.0)
                     total_loss = diff_loss + args.sr_loss_weight * sr_loss + args.mfe_loss_weight * mfe_loss
             else:
                 diff_loss, pred_sr = stad_model(lr_eeg, hr_eeg, sr_eeg)
                 sr_loss = F.l1_loss(pred_sr.float(), sr_eeg.float())
-                mfe_loss = mfe_loss_fn(pred_sr.float(), sr_eeg.float().detach())
+                mfe_loss = 0
+                for ch in range(pred_sr.shape[1]):
+                    mfe_loss += mfe_loss_fn(
+                        pred_sr[:, ch:ch+1, :],
+                        sr_eeg[:, ch:ch+1, :].detach()
+                    )
+                mfe_loss /= pred_sr.shape[1]
                 total_loss = diff_loss + args.sr_loss_weight * sr_loss + args.mfe_loss_weight * mfe_loss
 
             if not torch.isfinite(total_loss):
@@ -414,8 +433,8 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.05)
     parser.add_argument('--min_lr', type=float, default=1e-6)
-    parser.add_argument('--sr_loss_weight', type=float, default=0.1)
-    parser.add_argument('--mfe_loss_weight', type=float, default=0.1)
+    parser.add_argument('--sr_loss_weight', type=float, default=1)
+    parser.add_argument('--mfe_loss_weight', type=float, default=0.5)
     parser.add_argument('--mfe_m', type=int, default=2)
     parser.add_argument('--mfe_n', type=float, default=2.0)
     parser.add_argument('--mfe_tau_max', type=int, default=5)

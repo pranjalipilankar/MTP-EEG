@@ -38,7 +38,7 @@ class Config_MAE_DEAP():
         # ============================================
         # DEAP Dataset Parameters
         # ============================================
-        self.data_path = '/home/ab_students/EEG-MTP/codes/DEAP_split_dataset.npz'
+        self.data_path = '/DATA/EEG-MTP/DEAP'
         self.num_channels = 32      # DEAP EEG channels
         self.time_len = 8064        # Full trial length (or use chunks)
         
@@ -58,6 +58,6 @@ class Config_MAE_DEAP():
         # Paths
         # ============================================
         self.root_path = '/home/ab_students/EEG-MTP/'
-        self.output_path = os.path.join(self.root_path, 'trial_mae_DEAP/results/')
+        self.output_path = os.path.join(self.root_path, 'trial_mae_DEAP/results_kfold_subjectwise/')
         self.seed = 2024
         self.local_rank = 0

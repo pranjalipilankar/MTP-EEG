@@ -1029,7 +1029,7 @@ if __name__ == '__main__':
         prc_root_dir='/DATA/EEG-MTP/DEAP-PrC_final',
         lambda_signal=1.0,
         sr_loss_weight=0.5,
-        resume_stad_checkpoint='',
-        resume_optimizer=False,
+        resume_stad_checkpoint='latest_stad_prcoutput_fold5.pt',
+        resume_optimizer=True,
         save_optimizer_state=False,
     )
