@@ -134,7 +134,7 @@ class SpatioTemporalConditionModule(nn.Module):
         self.n_patches = seq_len // patch_size
         
         # === YOUR INNOVATION: Graph Harmonic Spatial Embeddings ===
-        self.register_buffer("graph_harmonics", None)  # Will be computed on first forward
+        self.register_buffer("graph_harmonics", None, persistent=False)  # Will be computed on first forward
         self.harmonic_proj = nn.Linear(n_harmonics, embed_dim)
         
         # === Temporal Processing (STAD paper) ===
@@ -183,16 +183,27 @@ class SpatioTemporalConditionModule(nn.Module):
     
     def forward(self, x, chan_pos, t_steps):
         B, C, T = x.shape
-        
-        # 1. Temporal CNN
-        x_conv = self.temporal_conv(x)  # [32, 128, 350]
-        x_conv = x_conv.transpose(1, 2)  # [32, 350, 128]
-        
-        # 2. SIMPLE temporal features
-        n_patches = T // self.patch_size  # 21
-        temporal_feat = x_conv.mean(dim=1)[:, None, None, :]  # [32, 1, 1, 128]
-        temporal_feat = temporal_feat.expand(-1, C, n_patches, -1)  # [32, 16, 21, 128]
-        temporal_feat = temporal_feat + self.pos_embed
+        n_patches = T // self.patch_size
+        usable_len = n_patches * self.patch_size
+
+        if n_patches != self.n_patches:
+            raise ValueError(
+                f"Expected {self.n_patches} temporal patches from seq_len={self.seq_len}, "
+                f"but got {n_patches} patches from input length T={T}."
+            )
+        if usable_len != T:
+            x = x[:, :, :usable_len]
+
+        # 1) Patch-wise temporal embedding (tokenization by channel and patch)
+        x_patches = x.reshape(B, C, n_patches, self.patch_size)  # (B, C, N, patch_size)
+        temporal_tokens = self.patch_embed(x_patches)  # (B, C, N, embed_dim)
+
+        # 2) Temporal convolution context (local temporal patterns)
+        x_conv = self.temporal_conv(x)  # (B, embed_dim, T)
+        x_conv = x_conv.reshape(B, self.embed_dim, n_patches, self.patch_size).mean(dim=-1)
+        x_conv = x_conv.permute(0, 2, 1).unsqueeze(1).expand(-1, C, -1, -1)  # (B, C, N, embed_dim)
+
+        temporal_feat = temporal_tokens + x_conv + self.pos_embed
         
         # 3. Spatial (unchanged)
         harmonics = self._compute_harmonics_if_needed(chan_pos)
@@ -235,7 +246,7 @@ class LightweightSpatioTemporalConditionModule(nn.Module):
         self.n_harmonics = n_harmonics
         
         # Graph harmonics
-        self.register_buffer("graph_harmonics", None)
+        self.register_buffer("graph_harmonics", None, persistent=False)
         self.harmonic_proj = nn.Linear(n_harmonics, embed_dim)
         
         # Simple temporal CNN

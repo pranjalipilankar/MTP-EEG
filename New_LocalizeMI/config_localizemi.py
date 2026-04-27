@@ -20,7 +20,7 @@ class Config_MAE_LocalizeMI:
         self.depth = 24             # Encoder depth
         self.num_heads = 16         # Number of attention heads
         self.decoder_num_heads = 16  # Decoder attention heads
-        self.sampling_rate = 250
+        self.sampling_rate = 500
         self.num_channels = 256     # SR-EEG with 256 
         self.hr_channels = 128
         self.lr_channels = 64

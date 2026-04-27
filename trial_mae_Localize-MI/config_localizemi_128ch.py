@@ -39,7 +39,7 @@ class Config_MAE_LocalizeMI_128ch:
         self.data_path = '/home/arnav-a5000/MTP-EEG/DATA/Localize-MI/derivatives/epochs_prc1'
         self.num_channels = 128     # Downsampled from 256 via EGI montage (every 2nd channel)
         self.time_len = 256         # 512ms @ 500Hz → 16 patches (better temporal context)
-        self.sampling_rate = 500    # Sampling rate
+        self.sampling_rate = 8000    # Sampling rate
         
         # Use individual epochs (already segmented)
         self.use_all_epochs = True  # Use all epochs from all runs

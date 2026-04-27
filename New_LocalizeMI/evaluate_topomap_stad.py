@@ -82,7 +82,7 @@ def get_channel_positions(n_channels, device='cpu', batch_size=1):
 class STAD_LocalizeMI(nn.Module):
     """STAD model for Localize-MI"""
     def __init__(self, lr_channels=64, hr_channels=128, sr_channels=256, 
-                 seq_len=2800, latent_dim=1024, n_harmonics=8):
+                 seq_len=2080, latent_dim=1024, n_harmonics=8):
         super().__init__()
         patch_size = 16
         num_patches = seq_len // patch_size
@@ -136,7 +136,7 @@ class STAD_LocalizeMI(nn.Module):
         MUST match training decoder exactly!
         """
         B = latent.size(0)
-        target_len = lr_eeg.size(-1) if lr_eeg is not None else 2800
+        target_len = lr_eeg.size(-1) if lr_eeg is not None else 2080
         
         # Decode latent → 128ch HR via MAE decoder
         cls_token = self.mae.cls_token.expand(B, -1, -1)
@@ -180,9 +180,9 @@ def load_test_samples_multireso(data_path, n_samples=100):
         for epoch_file in sorted(subj_dir.glob('*_epochs.npy')):
             data = np.load(epoch_file)
             for epoch_idx in range(data.shape[0]):
-                epoch = data[epoch_idx][:, :2800]
-                if epoch.shape[1] < 2800:
-                    epoch = np.pad(epoch, ((0,0), (0, 2800-epoch.shape[1])), mode='edge')
+                epoch = data[epoch_idx][:, :2080]
+                if epoch.shape[1] < 2080:
+                    epoch = np.pad(epoch, ((0,0), (0, 2080-epoch.shape[1])), mode='edge')
                 all_epochs_256.append(epoch)
     
     all_epochs_256 = np.array(all_epochs_256[-n_samples:])
@@ -271,7 +271,7 @@ def generate_sr_eeg(model, lr_eeg, device, diff_params, T=1000, ddim_steps=50):
     z0_pred = zt  # Denoised latent
     
     # ✅ FIX: Use SAME decoder as training (model.decode_latent_to_sr)
-    sr_eeg = model.decode_latent_to_sr(z0_pred, lr_eeg)  # (B, 256, 2800)
+    sr_eeg = model.decode_latent_to_sr(z0_pred, lr_eeg)  # (B, 256, 2080)
     
     return sr_eeg.cpu().numpy()
 
@@ -392,11 +392,11 @@ def visualize_random_channels(eeg_dict, sr_eeg, fs=8000, n_channels=10,
     Visualize time-series of randomly selected channels across resolutions
     """
     # Get actual time dimension from data
-    time_steps = eeg_dict['64ch'].shape[1]  # 2800
+    time_steps = eeg_dict['64ch'].shape[1]  # 2080
     
     # ✅ FIX: Clamp requested samples to available data
     n_samples_requested = int(duration_sec * fs)  # 0.5 * 8000 = 4000
-    n_samples = min(n_samples_requested, time_steps)  # min(4000, 2800) = 2800
+    n_samples = min(n_samples_requested, time_steps)  # min(4000, 2080) = 2080
     
     # ✅ FIX: Safe random start index
     if n_samples >= time_steps:
@@ -485,12 +485,12 @@ def visualize_channel_detail_comparison(eeg_dict, sr_eeg, fs=8000,
                                         save_path='channel_detail_comparison.png'):
     """Detailed comparison of a single channel across all resolutions"""
     # Get time dimension
-    time_steps = eeg_dict['64ch'].shape[1]  # 2800
+    time_steps = eeg_dict['64ch'].shape[1]  # 2080
     
     # Use shorter duration for detail view
     duration_sec = 0.2  # 200ms
     n_samples_requested = int(duration_sec * fs)  # 1600
-    n_samples = min(n_samples_requested, time_steps)  # min(1600, 2800) = 1600
+    n_samples = min(n_samples_requested, time_steps)  # min(1600, 2080) = 1600
     
     # ✅ FIX: Safe start index calculation
     if n_samples >= time_steps:

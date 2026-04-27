@@ -2,28 +2,58 @@
 """
 STAD Training for Localize-MI Dataset (256 channels, 8000Hz HD-EEG)
 Channel hierarchy (as per STAD paper):
-- LR (Low Res): 64 channels → STC conditioning module
+- LR (Low Res): 64 channels → conditioning
 - HR (High Res): 128 channels → MAE encoder → latents
 - Target: 256 channels (diffusion super-resolution)
-
-Uses pretrained MAE from trial_mae_Localize-MI/results_128ch/best_checkpoint.pth (128 channels)
 """
-
 import os
 import sys
+import argparse
+import json
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, Subset
-from torch.amp import GradScaler, autocast
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch import amp
 from tqdm import tqdm
-from scipy.signal import butter, filtfilt
 from pathlib import Path
-from einops.layers.torch import Rearrange
+from scipy.signal import butter, filtfilt
+try:
+    from einops import Rearrange
+except ImportError:
+    class Rearrange(nn.Module):
+        def __init__(self, pattern):
+            super().__init__()
+            self.pattern = pattern.replace(" ", "")
+
+        def forward(self, x):
+            if self.pattern == "btc->bct":
+                return x.transpose(1, 2)
+            if self.pattern == "bct->btc":
+                return x.transpose(1, 2)
+            raise ValueError(f"Unsupported Rearrange pattern: {self.pattern}")
+
+    print("Warning: einops not installed; using local Rearrange fallback.")
 
 from mae_for_eeg import MAEforEEG
 from spatio_temporal_condition import SpatioTemporalConditionModule
 from mtd_dreamdiff import MultiScaleTransformerDenoisingModule
+
+
+def get_localizemi_channel_indices(target_channels):
+    """
+    Return fixed Localize-MI channel subsets from 256-channel HD-EEG ordering.
+    These subsets provide spatial coverage across the electrode grid.
+    """
+    if target_channels == 256:
+        return np.arange(256, dtype=int)
+    if target_channels == 128:
+        return np.linspace(0, 255, 128, dtype=int)
+    if target_channels == 64:
+        return np.linspace(0, 255, 64, dtype=int)
+    
+    return np.linspace(0, 255, target_channels, dtype=int)
 
 
 def get_beta_schedule(timesteps=1000):
@@ -143,7 +173,7 @@ def pcc_loss(pred, target):
     return (1.0 - pcc).mean()
 
 
-def psd_loss(pred, target, fs=8000):
+def psd_loss(pred, target, fs=500):
     """
     Power Spectral Density Loss - preserves frequency band characteristics.
     
@@ -198,16 +228,17 @@ def validate_with_metrics(model, val_loader, device, diff_params, T=1000, num_sa
     all_snr = []
     samples_processed = 0
 
-    for x_lr, y_hr, y_sr in val_loader:
+    for batch in val_loader:
         if samples_processed >= num_samples:
             break
 
-        x_lr = x_lr.to(device)
-        y_hr = y_hr.to(device)
+        x_lr = batch['lr'].to(device)
+        y_hr = batch['hr'].to(device)
+        y_sr = batch['sr'].to(device)
         B = x_lr.size(0)
 
-        # Encode ground truth HR to latent
-        z0_true = model.encode_hr(y_hr)  # (B, 175, 1024)
+        # Encode ground truth SR to latent (via SR->HR projection)
+        z0_true = model.encode_sr(y_sr)  # (B, 175, 1024)
 
         # DDIM sampling with 50 steps
         ddim_steps = 50
@@ -245,7 +276,7 @@ def validate_with_metrics(model, val_loader, device, diff_params, T=1000, num_sa
         z0_pred = zt
 
         # Decode predicted latent to 256ch SR
-        pred_sr = model.decode_latent_to_sr(z0_pred, x_lr)  # (B, 256, 2800)
+        pred_sr = model.decode_latent_to_sr(z0_pred, x_lr)  # (B, 256, 2080)
         
         # Compare with 256ch ground truth SR
         y_sr = y_sr.to(device)
@@ -279,15 +310,66 @@ class LocalizeMISTADDataset(Dataset):
         lr_channels=64,
         hr_channels=128,
         sr_channels=256,
-        time_len=2800,
+        time_len=2080,
         fs=8000,
+        preprocessed=False,
     ):
         self.lr_channels = lr_channels
         self.hr_channels = hr_channels
         self.sr_channels = sr_channels
         self.time_len = time_len
         self.fs = fs
+        self.preprocessed = preprocessed
 
+        data_path = Path(data_path)
+
+        self._subject_arrays = []
+        self._sample_index = []
+
+        if preprocessed:
+            self._load_preprocessed_data(data_path, subjects)
+        else:
+            self._load_raw_data(data_path, subjects)
+
+        if indices is not None:
+            self._sample_index = [self._sample_index[i] for i in indices]
+            print(f"Using {len(self._sample_index)} segments from split")
+
+    def _resize_epoch(self, epoch):
+        if epoch.shape[1] > self.time_len:
+            return epoch[:, :self.time_len]
+        if epoch.shape[1] < self.time_len:
+            pad_width = ((0, 0), (0, self.time_len - epoch.shape[1]))
+            return np.pad(epoch, pad_width, mode='edge')
+        return epoch
+
+    def _standardize_epoch(self, epoch):
+        epoch = epoch.astype(np.float32, copy=False)
+        mean = epoch.mean(axis=-1, keepdims=True)
+        std = epoch.std(axis=-1, keepdims=True) + 1e-6
+        return (epoch - mean) / std
+
+    def _prepare_epoch(self, epoch, target_channels, apply_filters=True):
+        epoch = self._resize_epoch(epoch)
+        indices = self.get_egi_channel_indices(epoch.shape[0], target_channels)
+        epoch_sub = epoch[indices, :]
+
+        if apply_filters:
+            nyquist = 0.5 * self.fs
+            low = max(0.1 / nyquist, 0.00001)
+            high = min(100.0 / nyquist, 0.99)
+            b_band, a_band = butter(4, [low, high], 'band')
+            epoch_sub = filtfilt(b_band, a_band, epoch_sub, axis=-1)
+            for freq in [50, 100, 150, 200]:
+                if freq < nyquist:
+                    low_notch = max((freq - 1.0) / nyquist, 0.00001)
+                    high_notch = min((freq + 1.0) / nyquist, 0.99999)
+                    b_notch, a_notch = butter(2, [low_notch, high_notch], 'bandstop')
+                    epoch_sub = filtfilt(b_notch, a_notch, epoch_sub, axis=-1)
+
+        return self._standardize_epoch(epoch_sub)
+
+    def _load_raw_data(self, data_path, subjects):
         if subjects == 'all':
             subject_dirs = sorted(Path(data_path).glob('sub-*/eeg'))
         else:
@@ -301,58 +383,59 @@ class LocalizeMISTADDataset(Dataset):
             for epoch_file in sorted(subj_dir.glob('*_epochs.npy')):
                 data = np.load(epoch_file)  # (n_epochs, 256, 2081)
                 for epoch_idx in range(data.shape[0]):
-                    epoch = data[epoch_idx]  # (256, 2081)
-                    if epoch.shape[1] >= time_len:
-                        epoch = epoch[:, :time_len]
-                    else:
-                        pad_width = ((0, 0), (0, time_len - epoch.shape[1]))
-                        epoch = np.pad(epoch, pad_width, mode='edge')
-                    all_epochs.append(epoch)
+                    epoch = data[epoch_idx]
+                    all_epochs.append(self._prepare_epoch(epoch, self.sr_channels))
 
-        all_epochs = np.array(all_epochs)  # (total_epochs, 256, 2800)
-        print(f"Loaded {len(all_epochs)} epochs from 256 channels")
+        if len(all_epochs) == 0:
+            raise ValueError(f"No epochs found in {data_path}")
 
-        if indices is not None:
-            all_epochs = all_epochs[indices]
-            print(f"Using {len(all_epochs)} epochs from split")
-
-        self.sr_samples = all_epochs
-        self.hr_samples = self.prepare_samples(all_epochs, hr_channels)
-        self.lr_samples = self.prepare_samples(all_epochs, lr_channels)
+        self.sr_samples = np.asarray(all_epochs, dtype=np.float32)
+        self.hr_samples = np.asarray([self._prepare_epoch(epoch, self.hr_channels) for epoch in self.sr_samples], dtype=np.float32)
+        self.lr_samples = np.asarray([self._prepare_epoch(epoch, self.lr_channels) for epoch in self.sr_samples], dtype=np.float32)
+        self._sample_index = list(range(len(self.sr_samples)))
 
         print(f"Prepared {len(self.hr_samples)} segments")
         print(f"  SR shape (256ch): {self.sr_samples.shape}")
         print(f"  HR shape (128ch): {self.hr_samples.shape}")
         print(f"  LR shape (64ch):  {self.lr_samples.shape}")
 
+        print(f"Prepared {len(self.hr_samples)} segments")
+        print(f"  SR shape (256ch): {self.sr_samples.shape}")
+        print(f"  HR shape (128ch): {self.hr_samples.shape}")
+        print(f"  LR shape (64ch):  {self.lr_samples.shape}")
+
+    def _load_preprocessed_data(self, data_path, subjects):
+        """Load preprocessed data from epochs_prc1 format (X_prc1.npy files)"""
+        if subjects == 'all':
+            subject_dirs = sorted(data_path.glob('sub-*'))
+        else:
+            subject_dirs = [data_path / subj for subj in subjects]
+
+        print(f"Loading preprocessed Localize-MI data (X_prc1.npy format)...")
+        self._subject_arrays = []
+        self._sample_index = []
+
+        for subj_dir in subject_dirs:
+            if not subj_dir.exists():
+                continue
+
+            X_prc1_file = subj_dir / 'X_prc1.npy'
+            if X_prc1_file.exists():
+                data = np.load(X_prc1_file, mmap_mode='r')  # (n_windows, 256, T)
+                subject_idx = len(self._subject_arrays)
+                self._subject_arrays.append(data)
+                for window_idx in range(data.shape[0]):
+                    self._sample_index.append((subject_idx, window_idx))
+                print(f"  {subj_dir.name}: loaded {data.shape[0]} windows, shape {data.shape}")
+
+        if len(self._sample_index) == 0:
+            raise ValueError(f"No preprocessed data found in {data_path}")
+
+        print(f"Loaded {len(self._sample_index)} preprocessed windows from {len(self._subject_arrays)} subjects")
+
     def prepare_samples(self, epochs, target_channels):
         """Prepare samples with channel downsampling and preprocessing"""
-        indices = self.get_egi_channel_indices(epochs.shape[1], target_channels)
-        epochs_sub = epochs[:, indices, :]
-
-        def apply_filters(data):
-            nyquist = 0.5 * self.fs
-            low = max(0.1 / nyquist, 0.00001)
-            high = min(100.0 / nyquist, 0.99)
-            b_band, a_band = butter(4, [low, high], 'band')
-            data_filtered = filtfilt(b_band, a_band, data, axis=-1)
-            for freq in [50, 100, 150, 200]:
-                if freq < nyquist:
-                    low_notch = max((freq - 1.0) / nyquist, 0.00001)
-                    high_notch = min((freq + 1.0) / nyquist, 0.99999)
-                    b_notch, a_notch = butter(2, [low_notch, high_notch], 'bandstop')
-                    data_filtered = filtfilt(b_notch, a_notch, data_filtered, axis=-1)
-            return data_filtered
-
-        epochs_filtered = np.array([apply_filters(epoch) for epoch in epochs_sub])
-
-        for epoch_idx in range(len(epochs_filtered)):
-            for ch in range(epochs_filtered.shape[1]):
-                mean = epochs_filtered[epoch_idx, ch].mean()
-                std = epochs_filtered[epoch_idx, ch].std() + 1e-6
-                epochs_filtered[epoch_idx, ch] = (epochs_filtered[epoch_idx, ch] - mean) / std
-
-        return epochs_filtered.astype(np.float32)
+        return np.asarray([self._prepare_epoch(epoch, target_channels) for epoch in epochs], dtype=np.float32)
 
     def get_egi_channel_indices(self, full_channels, target_channels):
         if target_channels == 128:
@@ -368,23 +451,38 @@ class LocalizeMISTADDataset(Dataset):
         return indices[:target_channels]
 
     def __len__(self):
+        if self.preprocessed:
+            return len(self._sample_index)
         return len(self.hr_samples)
 
     def __getitem__(self, idx):
-        return (
-            torch.tensor(self.lr_samples[idx], dtype=torch.float32),
-            torch.tensor(self.hr_samples[idx], dtype=torch.float32),
-            torch.tensor(self.sr_samples[idx], dtype=torch.float32),
-        )
+        if self.preprocessed:
+            subject_idx, window_idx = self._sample_index[idx]
+            epoch = np.asarray(self._subject_arrays[subject_idx][window_idx], dtype=np.float32)
+            epoch = self._resize_epoch(epoch)
+            sr = self._standardize_epoch(epoch)
+            hr = self._prepare_epoch(epoch, self.hr_channels, apply_filters=False)
+            lr = self._prepare_epoch(epoch, self.lr_channels, apply_filters=False)
+            return {
+                'lr': torch.from_numpy(lr).float(),
+                'hr': torch.from_numpy(hr).float(),
+                'sr': torch.from_numpy(sr).float(),
+            }
+
+        return {
+            'lr': torch.from_numpy(self.lr_samples[idx]).float(),
+            'hr': torch.from_numpy(self.hr_samples[idx]).float(),
+            'sr': torch.from_numpy(self.sr_samples[idx]).float(),
+        }
 
 
 class STAD_LocalizeMI(nn.Module):
     """
     STAD model adapted for Localize-MI HD-EEG dataset.
-    Channel hierarchy (STAD paper):
+    Channel hierarchy (SEED4-style STAD flow):
     - Input LR: 64 channels → STC conditioning
-    - Input HR: 128 channels → MAE encoder → latent
-    - Output SR: 256 channels (diffusion upsamples)
+    - Input SR: 256 channels → project to HR(128) → MAE encoder → latent
+    - Output SR: 256 channels (decode HR then upsample head)
     """
 
     def __init__(
@@ -392,26 +490,34 @@ class STAD_LocalizeMI(nn.Module):
         lr_channels=64,
         hr_channels=128,
         sr_channels=256,
-        seq_len=2800,
+        seq_len=2080,
         latent_dim=1024,
         n_harmonics=8,
+        mae_time_len=256,
+        mae_patch_size=16,
+        mae_embed_dim=512,
+        mae_depth=12,
+        mae_num_heads=8,
+        mae_decoder_embed_dim=256,
+        mae_decoder_depth=8,
+        mae_decoder_num_heads=8,
+        mae_mlp_ratio=2.0,
     ):
         super().__init__()
 
-        patch_size = 16
-        num_patches = seq_len // patch_size  # 175
+        num_patches = mae_time_len // mae_patch_size
 
         self.mae = MAEforEEG(
-            time_len=seq_len,
-            patch_size=patch_size,
-            embed_dim=1024,
+            time_len=mae_time_len,
+            patch_size=mae_patch_size,
+            embed_dim=mae_embed_dim,
             in_chans=hr_channels,
-            depth=24,
-            num_heads=16,
-            decoder_embed_dim=512,
-            decoder_depth=8,
-            decoder_num_heads=16,
-            mlp_ratio=1.0,
+            depth=mae_depth,
+            num_heads=mae_num_heads,
+            decoder_embed_dim=mae_decoder_embed_dim,
+            decoder_depth=mae_decoder_depth,
+            decoder_num_heads=mae_decoder_num_heads,
+            mlp_ratio=mae_mlp_ratio,
             norm_layer=nn.LayerNorm,
         )
 
@@ -428,13 +534,19 @@ class STAD_LocalizeMI(nn.Module):
         self.mtd = MultiScaleTransformerDenoisingModule(
             num_patches=num_patches,
             latent_dim=latent_dim,
+            cond_dim=latent_dim,
             n_layers=8,
             n_heads=16,
             use_multiscale_conv=True,  # Enable multi-scale 1D convolutions (STAD Eq. 3)
         )
 
+        # Explicit projection before MAE encoding: SR(256) -> HR(128)
+        self.sr_to_hr_projection = nn.Conv1d(
+            sr_channels, hr_channels, kernel_size=1, bias=False
+        )
+
         # Super-resolution upsampling module: 128ch → 256ch (STAD paper: Decoder outputs SR directly)
-        self.sr_upsample = nn.Sequential(
+        self.hr_to_sr_upsampler = nn.Sequential(
             # (B, T, 128) → (B, 128, T)
             Rearrange('b t c -> b c t'),
             
@@ -455,14 +567,21 @@ class STAD_LocalizeMI(nn.Module):
 
         self.latent_dim = latent_dim
         self.num_patches = num_patches
+        self.mae_time_len = mae_time_len
         self.sr_channels = sr_channels
         self.hr_channels = hr_channels
         self.lr_channels = lr_channels
 
-    def encode_hr(self, hr_eeg):
-        """Encode HR EEG to latent (unnormalized for diffusion)"""
-        latent, _, _ = self.mae.forward_encoder(hr_eeg, mask_ratio=0.0)
-        latent = latent[:, 1:, :]  # Remove CLS → (B, 175, 1024)
+    def encode_sr(self, sr_eeg):
+        """Encode SR EEG to latent via explicit SR->HR projection."""
+        hr_projected = self.sr_to_hr_projection(sr_eeg)
+        if hr_projected.size(-1) != self.mae_time_len:
+            hr_projected = torch.nn.functional.interpolate(
+                hr_projected.unsqueeze(1), size=(self.hr_channels, self.mae_time_len),
+                mode='bilinear', align_corners=False
+            ).squeeze(1)
+        latent, _, _ = self.mae.forward_encoder(hr_projected, mask_ratio=0.0)
+        latent = latent[:, 1:, :]
         return latent
 
     def decode_latent_to_sr(self, latent, lr_eeg=None):
@@ -471,11 +590,11 @@ class STAD_LocalizeMI(nn.Module):
         LR conditioning only used in MTD during denoising, not in decoder.
         
         Args:
-            latent: (B, 175, 1024) - Denoised latent from diffusion
+            latent: (B, num_patches, latent_dim) - Denoised latent from diffusion
             lr_eeg: (B, 64, T) - Only used to get target temporal length
         """
         B = latent.size(0)
-        target_len = lr_eeg.size(-1) if lr_eeg is not None else 2800
+        target_len = lr_eeg.size(-1) if lr_eeg is not None else 2080
         
         # Decode latent to 128ch HR via MAE decoder
         cls_token = self.mae.cls_token.expand(B, -1, -1)
@@ -483,10 +602,10 @@ class STAD_LocalizeMI(nn.Module):
         hr_patches = self.mae.forward_decoder(
             latent_with_cls, 
             torch.zeros(B, self.num_patches, dtype=torch.long, device=latent.device)
-        )  # (B, 175, 2048) - patches [num_patches, chan*patch_size]
+        )
         
         # Unpatchify: convert patches back to full signal
-        hr_eeg = self.mae.unpatchify(hr_patches)  # (B, 128, 2800) - full EEG signal
+        hr_eeg = self.mae.unpatchify(hr_patches)  # (B, 128, 2080) - full EEG signal
         
         # Resize MAE output to match target length if needed
         if hr_eeg.size(-1) != target_len:
@@ -497,7 +616,7 @@ class STAD_LocalizeMI(nn.Module):
         
         # Apply learned upsampling: 128ch → 256ch (per STAD Figure 2: Decoder → SR EEG)
         hr_eeg_t = hr_eeg.transpose(1, 2)  # (B, target_len, 128)
-        sr_eeg_t = self.sr_upsample(hr_eeg_t)  # (B, target_len, 256)
+        sr_eeg_t = self.hr_to_sr_upsampler(hr_eeg_t)  # (B, target_len, 256)
         sr_eeg = sr_eeg_t.transpose(1, 2)  # (B, 256, target_len)
         
         return sr_eeg
@@ -508,8 +627,61 @@ class STAD_LocalizeMI(nn.Module):
         return self.mtd(zt, t_steps, cond_tokens, cond_pooled)
 
 
-def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resume_from=None,
-                          loss_weights={'diff': 1.0, 'recon_mse': 0.05, 'recon_pcc': 0.4, 'recon_psd': 0.6}):
+def load_mae_fold_subject_split(mae_results_dir, fold):
+    """Load train/val subjects for a MAE fold from fold_splits.json."""
+    split_file = Path(mae_results_dir) / 'fold_splits.json'
+    if not split_file.exists():
+        raise FileNotFoundError(f"fold_splits.json not found: {split_file}")
+
+    with open(split_file, 'r', encoding='utf-8') as f:
+        splits = json.load(f)
+
+    matched = None
+    for item in splits:
+        if int(item.get('fold', -1)) == int(fold):
+            matched = item
+            break
+
+    if matched is None:
+        available = [int(x.get('fold', -1)) for x in splits]
+        raise ValueError(
+            f"Fold {fold} not found in {split_file}. Available folds: {available}"
+        )
+
+    return matched['train_subjects'], matched['val_subjects']
+
+
+def load_matching_state_dict(target_module, checkpoint_state_dict):
+    """Load only tensors whose names and shapes match the target module."""
+    target_state_dict = target_module.state_dict()
+    filtered_state_dict = {}
+    skipped_keys = []
+
+    for key, value in checkpoint_state_dict.items():
+        if key in target_state_dict and target_state_dict[key].shape == value.shape:
+            filtered_state_dict[key] = value
+        else:
+            skipped_keys.append(key)
+
+    missing_keys, unexpected_keys = target_module.load_state_dict(filtered_state_dict, strict=False)
+    return missing_keys, unexpected_keys, skipped_keys
+
+
+def train_stad_localizemi(
+    data_path,
+    mae_results_dir,
+    mae_fold=3,
+    num_epochs=300,
+    batch_size=8,
+    lr=2e-4,
+    resume_from=None,
+    train_workers=0,
+    val_workers=0,
+    pin_memory=False,
+    persistent_workers=False,
+    preprocessed=True,
+    loss_weights={'diff': 1.0, 'sr_l1': 0.5},
+):
     """
     Train STAD on Localize-MI dataset.
     
@@ -548,46 +720,54 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
     """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+    # Keep outputs/checkpoints anchored to this script directory for reliable resume.
+    run_dir = Path(__file__).resolve().parent
+    best_ckpt_path = run_dir / 'best_stad_localizemi.pt'
+    metrics_path = run_dir / 'metrics_history_localizemi.npy'
+
+    diff_weight = float(loss_weights.get('diff', 1.0))
+    sr_l1_weight = float(loss_weights.get('sr_l1', loss_weights.get('recon_mse', 0.5)))
+
     print("=" * 60)
     print("STAD Training - Localize-MI HD-EEG Dataset (256 channels, 8000Hz)")
     print("Motor Imagery Task: Hand/Foot Movement Imagination")
     print("=" * 60)
-    print(f"\n🎯 Loss Weights (Optimized for Motor Imagery):")
-    print(f"   Diffusion:      {loss_weights['diff']:.2f} (primary denoising objective)")
-    print(f"   MSE:            {loss_weights['recon_mse']:.2f} (amplitude - less critical for MI)")
-    print(f"   PCC:            {loss_weights['recon_pcc']:.2f} (temporal patterns - moderate importance)")
-    print(f"   PSD:            {loss_weights['recon_psd']:.2f} (frequency content - CRITICAL for MI)")
-    print(f"\n💡 Rationale: MI biomarkers = Beta ERD/ERS (13-30 Hz) + Mu rhythm (8-13 Hz)")
-    print(f"   → High PSD weight ensures accurate spectral reconstruction\n")
+    print(f"\nLoss Weights (SEED4-style objective):")
+    print(f"   Diffusion:      {diff_weight:.2f}")
+    print(f"   SR L1:          {sr_l1_weight:.2f}")
+    print("   Total:          diff + sr_l1_weight * sr_l1\n")
+    print(f"Dataset mode: {'preprocessed (X_prc1.npy)' if preprocessed else 'raw epochs (*_epochs.npy)'}")
 
-    # ── Dataset splits ──────────────────────────────────────────────────────────
-    print("📦 Preparing dataset splits...")
-    temp_dataset = LocalizeMISTADDataset(data_path, subjects='all')
-    total_size = len(temp_dataset)
-
-    np.random.seed(42)
-    indices = np.random.permutation(total_size)
-    train_size = int(0.7 * total_size)
-    val_size = int(0.15 * total_size)
-    train_idx = indices[:train_size]
-    val_idx = indices[train_size:train_size + val_size]
+    # ── Dataset splits (match MAE fold subjects to prevent leakage) ────────────
+    print("📦 Preparing dataset splits (from MAE fold subjects)...")
+    train_subjects, val_subjects = load_mae_fold_subject_split(mae_results_dir, mae_fold)
+    print(f"  MAE fold: {mae_fold}")
+    print(f"  Train subjects ({len(train_subjects)}): {train_subjects}")
+    print(f"  Val subjects ({len(val_subjects)}): {val_subjects}")
 
     train_dataset = LocalizeMISTADDataset(
-        data_path, subjects='all', indices=train_idx,
-        lr_channels=64, hr_channels=128, sr_channels=256, time_len=2800,
+        data_path, subjects=train_subjects,
+        lr_channels=64, hr_channels=128, sr_channels=256, time_len=2080,
+        preprocessed=preprocessed,
     )
     val_dataset = LocalizeMISTADDataset(
-        data_path, subjects='all', indices=val_idx,
-        lr_channels=64, hr_channels=128, sr_channels=256, time_len=2800,
+        data_path, subjects=val_subjects,
+        lr_channels=64, hr_channels=128, sr_channels=256, time_len=2080,
+        preprocessed=preprocessed,
     )
+
+    train_persistent_workers = persistent_workers and train_workers > 0
+    val_persistent_workers = persistent_workers and val_workers > 0
 
     train_loader = DataLoader(
         train_dataset, batch_size, shuffle=True,
-        num_workers=4, drop_last=True, pin_memory=True,
+        num_workers=train_workers, drop_last=True, pin_memory=pin_memory,
+        persistent_workers=train_persistent_workers,
     )
     val_loader = DataLoader(
         val_dataset, batch_size, shuffle=False,
-        num_workers=2, pin_memory=True,
+        num_workers=val_workers, pin_memory=pin_memory,
+        persistent_workers=val_persistent_workers,
     )
 
     print(f"\n📊 Dataset (STAD channel hierarchy):")
@@ -598,25 +778,80 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
     print(f"  Val:   {len(val_dataset)} epochs")
     print(f"  Batches/epoch: {len(train_loader)}\n")
 
-    # ── Model ───────────────────────────────────────────────────────────────────
+    # ── Resolve MAE checkpoint and build model with matching MAE architecture ──
+    mae_checkpoint = str(Path(mae_results_dir) / f'fold_{mae_fold}' / 'best_model.pth')
+    mae_payload = None
+    mae_state_dict = None
+    mae_cfg = {}
+
+    if os.path.exists(mae_checkpoint):
+        mae_payload = torch.load(mae_checkpoint, map_location='cpu', weights_only=False)
+        if 'model_state_dict' in mae_payload:
+            mae_state_dict = mae_payload['model_state_dict']
+        elif 'model' in mae_payload:
+            mae_state_dict = mae_payload['model']
+        else:
+            mae_state_dict = mae_payload
+        if isinstance(mae_payload, dict) and isinstance(mae_payload.get('config', None), dict):
+            mae_cfg = mae_payload['config']
+
+    mae_time_len = int(mae_cfg.get('time_len', 256))
+    mae_patch_size = int(mae_cfg.get('patch_size', 16))
+    mae_embed_dim = int(mae_cfg.get('embed_dim', 512))
+    mae_depth = int(mae_cfg.get('depth', 12))
+    mae_num_heads = int(mae_cfg.get('num_heads', 8))
+    mae_decoder_embed_dim = int(mae_cfg.get('decoder_embed_dim', 256))
+    mae_decoder_depth = int(mae_cfg.get('decoder_depth', 8))
+    mae_decoder_num_heads = int(mae_cfg.get('decoder_num_heads', 8))
+    mae_mlp_ratio = float(mae_cfg.get('mlp_ratio', 2.0))
+
     model = STAD_LocalizeMI(
-        lr_channels=64, hr_channels=128, sr_channels=256,
-        seq_len=2800, latent_dim=1024, n_harmonics=8,
+        lr_channels=64,
+        hr_channels=128,
+        sr_channels=256,
+        seq_len=2080,
+        latent_dim=mae_embed_dim,
+        n_harmonics=8,
+        mae_time_len=mae_time_len,
+        mae_patch_size=mae_patch_size,
+        mae_embed_dim=mae_embed_dim,
+        mae_depth=mae_depth,
+        mae_num_heads=mae_num_heads,
+        mae_decoder_embed_dim=mae_decoder_embed_dim,
+        mae_decoder_depth=mae_decoder_depth,
+        mae_decoder_num_heads=mae_decoder_num_heads,
+        mae_mlp_ratio=mae_mlp_ratio,
     ).to(device)
 
-    # Load pretrained MAE
-    mae_checkpoint = '/home/ab_students/EEG-MTP/trial_mae_Localize-MI/results_128ch/best_checkpoint.pth'
-    if os.path.exists(mae_checkpoint):
-        ckpt = torch.load(mae_checkpoint, map_location='cpu', weights_only=False)
-        model.mae.load_state_dict(ckpt['model'])
-        print(f"✅ Loaded pretrained MAE from {mae_checkpoint}")
-        print(f"   MAE correlation: {ckpt['correlation']:.4f}")
-        print(f"   MAE epoch: {ckpt['epoch']}\n")
-        del ckpt
+    if mae_state_dict is not None:
+        missing_keys, unexpected_keys, skipped_keys = load_matching_state_dict(model.mae, mae_state_dict)
+        epoch = mae_payload.get('epoch', 'N/A') if isinstance(mae_payload, dict) else 'N/A'
+        val_loss = mae_payload.get('val_loss', 'N/A') if isinstance(mae_payload, dict) else 'N/A'
+        val_cor = mae_payload.get('val_cor', mae_payload.get('val_corr', 'N/A')) if isinstance(mae_payload, dict) else 'N/A'
+        print(f"✅ Loaded pretrained MAE from k-fold training (fold {mae_fold})")
+        print(f"   Checkpoint: {mae_checkpoint}")
+        print(
+            f"   MAE config: time_len={mae_time_len}, patch={mae_patch_size}, "
+            f"embed={mae_embed_dim}, depth={mae_depth}, heads={mae_num_heads}"
+        )
+        if skipped_keys:
+            print(f"   Skipped incompatible MAE tensors: {len(skipped_keys)}")
+        if missing_keys:
+            print(f"   Missing MAE tensors after load: {len(missing_keys)}")
+        if unexpected_keys:
+            print(f"   Unexpected MAE tensors after load: {len(unexpected_keys)}")
+        if isinstance(epoch, int):
+            print(f"   Best epoch: {epoch}")
+        if isinstance(val_loss, (int, float)):
+            print(f"   Val loss: {val_loss:.6f}")
+        if isinstance(val_cor, (int, float)):
+            print(f"   Val correlation: {val_cor:.4f}")
+        print()
+        del mae_payload
         torch.cuda.empty_cache()
     else:
         print(f"⚠️  MAE checkpoint not found: {mae_checkpoint}")
-        print("   Training without pretrained weights\n")
+        print("   Training without pretrained MAE weights\n")
 
     # Freeze MAE initially
     for p in model.mae.parameters():
@@ -641,31 +876,44 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, num_epochs)
     criterion = nn.MSELoss()
-    scaler = GradScaler('cuda')
+    scaler = amp.GradScaler('cuda')
 
     best_val_loss = float('inf')
     metrics_history = []
     start_epoch = 0
 
     # ── Resume from checkpoint ───────────────────────────────────────────────────
-    if resume_from and os.path.exists(resume_from):
-        print(f"\n🔄 Resuming from checkpoint: {resume_from}")
-        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+    resume_path = None
+    if resume_from:
+        candidate = Path(resume_from)
+        if not candidate.is_absolute():
+            candidate = run_dir / candidate
+        candidate = candidate.expanduser().resolve()
+        if candidate.exists():
+            resume_path = candidate
+        else:
+            print(f"\n⚠️  Resume checkpoint not found: {candidate}")
+
+    if resume_path is not None:
+        print(f"\nResuming from checkpoint: {resume_path}")
+        ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
         missing_keys, unexpected_keys = model.load_state_dict(ckpt['model'], strict=False)
         if unexpected_keys:
-            print(f"  ⚠️  Ignoring unexpected keys: {unexpected_keys}")
+            print(f"  Ignoring unexpected keys: {unexpected_keys}")
         if missing_keys:
-            print(f"  ⚠️  Missing keys (random init): {missing_keys}")
-        optimizer.load_state_dict(ckpt['optimizer'])
+            print(f"  Missing keys (random init): {missing_keys}")
+        if 'optimizer' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer'])
         start_epoch = ckpt['epoch'] + 1
         best_val_loss = ckpt.get('val_loss', float('inf'))
         metrics_history = ckpt.get('metrics_history', [])
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, num_epochs - start_epoch
-        )
-        print(f"✅ Resumed from epoch {ckpt['epoch']}")
-        print(f"   Best val loss: {best_val_loss:.6f}")
-        print(f"   Continuing from epoch {start_epoch}\n")
+        if start_epoch < num_epochs:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, num_epochs - start_epoch
+            )
+        print(f"Resumed from epoch {ckpt['epoch']}")
+        print(f"Best val loss so far: {best_val_loss:.6f}")
+        print(f"Continuing from epoch {start_epoch}\n")
         del ckpt
         torch.cuda.empty_cache()
 
@@ -687,11 +935,13 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
 
             train_loader = DataLoader(
                 train_dataset, batch_size=new_batch_size, shuffle=True,
-                num_workers=4, pin_memory=True, persistent_workers=True,
+                num_workers=train_workers, pin_memory=pin_memory,
+                persistent_workers=train_persistent_workers,
             )
             val_loader = DataLoader(
                 val_dataset, batch_size=new_batch_size, shuffle=False,
-                num_workers=4, pin_memory=True, persistent_workers=True,
+                num_workers=val_workers, pin_memory=pin_memory,
+                persistent_workers=val_persistent_workers,
             )
 
             for param in model.mae.parameters():
@@ -711,24 +961,25 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
         train_loss = 0.0
         nan_batches = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-        for batch_idx, (x_lr, y_hr, y_sr) in enumerate(pbar):
-            x_lr  = x_lr.to(device)
-            y_hr  = y_hr.to(device)
-            y_sr  = y_sr.to(device)
+        use_tqdm = sys.stdout.isatty()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}") if use_tqdm else train_loader
+        for batch_idx, batch in enumerate(pbar):
+            x_lr  = batch['lr'].to(device)
+            y_hr  = batch['hr'].to(device)
+            y_sr  = batch['sr'].to(device)
             B = x_lr.size(0)
 
             # Skip batches with NaN inputs
-            if torch.isnan(x_lr).any() or torch.isnan(y_hr).any():
+            if torch.isnan(x_lr).any() or torch.isnan(y_sr).any():
                 print(f"\n⚠️  NaN in inputs at batch {batch_idx} - skipping")
                 nan_batches += 1
                 continue
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast('cuda', dtype=torch.float16):
-                # Encode HR → latent
-                z0 = model.encode_hr(y_hr)  # (B, 175, 1024)
+            with amp.autocast('cuda', dtype=torch.float16):
+                # Encode SR -> HR projection -> latent
+                z0 = model.encode_sr(y_sr)  # (B, 175, 1024)
 
                 if torch.isnan(z0).any():
                     print(f"\n⚠️  NaN in latent at batch {batch_idx} - skipping")
@@ -757,20 +1008,16 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
                     nan_batches += 1
                     continue
 
-                # Diffusion denoising loss
+                # Diffusion denoising loss.
                 diff_loss = criterion(pred_epsilon, epsilon)
 
-                # Reconstruction loss: decode to 256ch SR and compare with target
-                sr_recon = model.decode_latent_to_sr(z0, x_lr)
-                recon_mse = criterion(sr_recon, y_sr)
-                recon_pcc = pcc_loss(sr_recon, y_sr)
-                recon_psd = psd_loss(sr_recon, y_sr, fs=8000)
+                # SEED4-style SR supervision from denoised latent estimate.
+                pred_z0 = (zt - sqrt_one_minus * pred_epsilon) / (sqrt_alpha + 1e-8)
+                pred_z0 = torch.clamp(pred_z0, min=-10.0, max=10.0)
+                sr_pred = model.decode_latent_to_sr(pred_z0, x_lr)
+                sr_l2 = F.mse_loss(sr_pred.float(), y_sr.float())
 
-                # Combined loss (weighted)
-                loss = (loss_weights['diff'] * diff_loss + 
-                       loss_weights['recon_mse'] * recon_mse + 
-                       loss_weights['recon_pcc'] * recon_pcc + 
-                       loss_weights['recon_psd'] * recon_psd)
+                loss = diff_weight * diff_loss + sr_l1_weight * sr_l2
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"\n⚠️  NaN/Inf loss at batch {batch_idx} - skipping")
@@ -802,13 +1049,17 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
             scaler.update()
 
             train_loss += loss.item()
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'diff': f'{diff_loss.item():.4f}',
-                'mse': f'{recon_mse.item():.4f}',
-                'pcc': f'{recon_pcc.item():.4f}',
-                'psd': f'{recon_psd.item():.4f}'
-            })
+            if use_tqdm:
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'diff': f'{diff_loss.item():.4f}',
+                    'sr_l2': f'{sr_l2.item():.4f}'
+                })
+            elif (batch_idx + 1) % 50 == 0:
+                print(
+                    f"  Batch {batch_idx + 1}/{len(train_loader)} | "
+                    f"loss={loss.item():.4f} diff={diff_loss.item():.4f} sr_l2={sr_l2.item():.4f}"
+                )
 
         # Aggregate train loss
         valid_batches = len(train_loader) - nan_batches
@@ -829,18 +1080,22 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
         model.eval()
         val_loss = 0.0
         val_nan_batches = 0
+        val_nmse_scores = []
+        val_pcc_scores = []
+        val_snr_scores = []
 
         with torch.no_grad():
-            for x_lr, y_hr, y_sr in val_loader:
-                x_lr = x_lr.to(device)
-                y_hr = y_hr.to(device)
+            for batch in val_loader:
+                x_lr = batch['lr'].to(device)
+                y_hr = batch['hr'].to(device)
+                y_sr = batch['sr'].to(device)
                 B = x_lr.size(0)
 
-                if torch.isnan(x_lr).any() or torch.isnan(y_hr).any():
+                if torch.isnan(x_lr).any() or torch.isnan(y_sr).any():
                     val_nan_batches += 1
                     continue
 
-                z0 = model.encode_hr(y_hr)
+                z0 = model.encode_sr(y_sr)
                 if torch.isnan(z0).any():
                     val_nan_batches += 1
                     continue
@@ -864,9 +1119,18 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
                     val_nan_batches += 1
                     continue
 
-                loss_val = criterion(pred_epsilon, epsilon)
+                diff_val = criterion(pred_epsilon, epsilon)
+                pred_z0 = (zt - sqrt_one_minus * pred_epsilon) / (sqrt_alpha + 1e-8)
+                pred_z0 = torch.clamp(pred_z0, min=-10.0, max=10.0)
+                sr_pred_val = model.decode_latent_to_sr(pred_z0, x_lr)
+                sr_l2_val = F.mse_loss(sr_pred_val.float(), y_sr.float())
+                loss_val = diff_weight * diff_val + sr_l1_weight * sr_l2_val
+
                 if not (torch.isnan(loss_val) or torch.isinf(loss_val)):
                     val_loss += loss_val.item()
+                    val_nmse_scores.append(compute_nmse(sr_pred_val.float(), y_sr.float()))
+                    val_pcc_scores.append(compute_pcc(sr_pred_val.float(), y_sr.float()))
+                    val_snr_scores.append(compute_snr(sr_pred_val.float(), y_sr.float()))
 
         if val_nan_batches > 0:
             print(f"  ⚠️  {val_nan_batches} validation batches had NaN")
@@ -879,34 +1143,29 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
             print("  ⚠️  Validation loss is NaN - using previous best")
             val_loss = best_val_loss
 
+        mean_val_nmse = float(np.mean(val_nmse_scores)) if val_nmse_scores else float('inf')
+        mean_val_pcc = float(np.mean(val_pcc_scores)) if val_pcc_scores else 0.0
+        mean_val_snr = float(np.mean(val_snr_scores)) if val_snr_scores else -float('inf')
+
         scheduler.step()
 
         print(
             f"Epoch {epoch+1:3d}/{num_epochs} | "
             f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
+            f"PCC: {mean_val_pcc:.4f} | NMSE: {mean_val_nmse:.4f} | "
+            f"SNR: {mean_val_snr:.2f} dB | "
             f"LR: {optimizer.param_groups[0]['lr']:.2e}"
         )
 
-        # Detailed metrics every 10 epochs
-        if (epoch + 1) % 10 == 0:
-            print(f"\n{'='*60}")
-            print(f"  📊 Computing validation metrics (epoch {epoch+1})...")
-            print(f"{'='*60}")
-            metrics = validate_with_metrics(
-                model, val_loader, device, diff_params, T=T, num_samples=100
-            )
-            print(f"  NMSE: {metrics['nmse']:.6f}")
-            print(f"  PCC:  {metrics['pcc']:.4f}")
-            print(f"  SNR:  {metrics['snr']:.2f} dB")
-            print(f"{'='*60}\n")
-
-            metrics_history.append({
-                'epoch': epoch + 1,
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                **metrics,
-            })
-            np.save('metrics_history_localizemi.npy', metrics_history)
+        metrics_history.append({
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'nmse': mean_val_nmse,
+            'pcc': mean_val_pcc,
+            'snr': mean_val_snr,
+        })
+        np.save(str(metrics_path), metrics_history)
 
         # Sanity checks
         if epoch > 10:
@@ -927,12 +1186,15 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
                 'lr_channels': 64,
                 'hr_channels': 128,
                 'sr_channels': 256,
-                'seq_len': 2800,
+                'seq_len': 2080,
                 'latent_dim': 1024,
-                'epoch_duration_ms': 350,
+                'epoch_duration_ms': 260,
                 'filters': 'highpass_0.1Hz_notch_50_100_150_200Hz',
-                'mae_checkpoint': 'trial_mae_Localize-MI/results_128ch/best_checkpoint.pth',
-                'loss_weights': loss_weights,
+                'mae_checkpoint': mae_checkpoint,
+                'mae_fold': mae_fold,
+                'train_subjects': train_subjects,
+                'val_subjects': val_subjects,
+                'loss_weights': {'diff': diff_weight, 'sr_l1': sr_l1_weight},
                 'dataset_info': 'Motor Imagery (MI) - hand/foot movement imagination',
                 'mi_bands': 'Beta (13-30 Hz) ERD/ERS, Mu (8-13 Hz) motor cortex',
             },
@@ -940,13 +1202,13 @@ def train_stad_localizemi(data_path, num_epochs=300, batch_size=8, lr=2e-4, resu
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(checkpoint, 'best_stad_localizemi.pt')
-            print(f"  ✅ Saved best model (val_loss={val_loss:.6f})")
+            torch.save(checkpoint, str(best_ckpt_path))
+            print(f"  Saved best model: {best_ckpt_path.name} (val_loss={val_loss:.6f})")
 
         if (epoch + 1) % 20 == 0:
-            torch.save(checkpoint, f'checkpoint_localizemi_epoch_{epoch+1}.pt')
-            print("  💾 Saved checkpoint")
-
+            epoch_ckpt_path = run_dir / f'checkpoint_localizemi_epoch_{epoch+1}.pt'
+            torch.save(checkpoint, str(epoch_ckpt_path))
+            print(f"  Saved checkpoint: {epoch_ckpt_path.name}")
     # ── Final summary ────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("🎉 Training complete!")
@@ -963,33 +1225,52 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='Train STAD on Localize-MI dataset')
+    parser.add_argument('--data_path', type=str,
+                        default='/home/arnav-a5000/MTP-EEG/DATA/Localize-MI/derivatives/epochs_prc1',
+                        help='Path to preprocessed Localize-MI folder with sub-*/X_prc1.npy')
+    parser.add_argument('--mae_results_dir', type=str,
+                        default='/home/arnav-a5000/MTP-EEG/trial_mae_Localize-MI/results_128ch_kfold_prc1_run_20260422_205948',
+                        help='Path to MAE k-fold results containing fold_splits.json and fold_*/best_model.pth')
+    parser.add_argument('--mae_fold', type=int, default=3,
+                        help='MAE fold to use for checkpoint and subject split (1-5)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=2e-4)
+    parser.add_argument('--train_workers', type=int, default=0,
+                        help='Training DataLoader workers (set 0 to minimize host RAM usage)')
+    parser.add_argument('--val_workers', type=int, default=0,
+                        help='Validation DataLoader workers (set 0 to minimize host RAM usage)')
+    parser.add_argument('--pin_memory', action='store_true',
+                        help='Enable pinned CPU memory for faster host->GPU transfer (uses more RAM)')
+    parser.add_argument('--persistent_workers', action='store_true',
+                        help='Keep DataLoader workers alive between epochs (requires workers > 0)')
+    parser.add_argument('--raw_epochs', action='store_true',
+                        help='Use raw epochs from derivatives/epochs (sub-*/eeg/*_epochs.npy) instead of preprocessed X_prc1.npy')
     parser.add_argument('--diff_weight', type=float, default=1.0,
                         help='Weight for diffusion loss')
-    parser.add_argument('--mse_weight', type=float, default=0.05,
-                        help='Weight for MSE reconstruction loss (reduced for MI: amplitude less critical)')
-    parser.add_argument('--pcc_weight', type=float, default=0.4,
-                        help='Weight for PCC reconstruction loss (moderate for MI: temporal patterns important)')
-    parser.add_argument('--psd_weight', type=float, default=0.6,
-                        help='Weight for PSD reconstruction loss (HIGH for MI: beta/mu bands critical)')
+    parser.add_argument('--sr_l1_weight', type=float, default=0.5,
+                        help='Weight for SR L1 reconstruction loss (SEED4-style objective)')
     args = parser.parse_args()
 
     loss_weights = {
         'diff': args.diff_weight,
-        'recon_mse': args.mse_weight,
-        'recon_pcc': args.pcc_weight,
-        'recon_psd': args.psd_weight
+        'sr_l1': args.sr_l1_weight,
     }
 
     train_stad_localizemi(
-        data_path='/home/ab_students/EEG-MTP/DATA/Localize-MI/derivatives/epochs',
+        data_path=args.data_path,
+        mae_results_dir=args.mae_results_dir,
+        mae_fold=args.mae_fold,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         resume_from=args.resume,
+        train_workers=args.train_workers,
+        val_workers=args.val_workers,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        preprocessed=(not args.raw_epochs),
         loss_weights=loss_weights
     )

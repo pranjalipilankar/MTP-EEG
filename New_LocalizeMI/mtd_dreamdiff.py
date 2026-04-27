@@ -43,6 +43,7 @@ class MultiScaleTransformerDenoisingModule(nn.Module):
         self,
         num_patches=100,      # ✅ Changed from hr_channels
         latent_dim=256,       # ✅ Increased from 128
+        cond_dim=None,
         n_layers=6,
         n_heads=16,
         dropout=0.1,
@@ -51,6 +52,7 @@ class MultiScaleTransformerDenoisingModule(nn.Module):
         super().__init__()
         self.num_patches = num_patches
         self.latent_dim = latent_dim
+        self.cond_dim = cond_dim if cond_dim is not None else latent_dim
         self.n_heads = n_heads
         self.use_multiscale_conv = use_multiscale_conv
         
@@ -109,9 +111,11 @@ class MultiScaleTransformerDenoisingModule(nn.Module):
         ])
         self.norm_self = nn.LayerNorm(latent_dim)
         
-        # ✅ FIX: Conditioning projection (defined in __init__, not forward!)
-        # This will project STC output to match MTD latent_dim if needed
-        self.cond_proj = None  # Will be initialized if needed
+        # Match LR-conditioning feature width to latent width when needed.
+        if self.cond_dim != self.latent_dim:
+            self.cond_proj = nn.Linear(self.cond_dim, self.latent_dim)
+        else:
+            self.cond_proj = nn.Identity()
         
         # Final projection (optional, can help with stability)
         self.output_proj = nn.Sequential(
@@ -177,23 +181,37 @@ class MultiScaleTransformerDenoisingModule(nn.Module):
         # ============================================================
         # 4. Cross-Attention with LR Conditioning (STAD Eq. 5)
         # ============================================================
-        # cond_tokens: (B, lr_channels, embed_dim)
-        # We need to match dimensions if embed_dim != latent_dim
-        
-        # If dimensions don't match, project conditioning
-        if cond_tokens.shape[-1] != self.latent_dim:
-            # Add a projection layer (define in __init__ if needed)
-            if not hasattr(self, 'cond_proj'):
-                self.cond_proj = nn.Linear(cond_tokens.shape[-1], self.latent_dim).to(cond_tokens.device)
-            cond_tokens = self.cond_proj(cond_tokens)
+        # SEED4-style token conditioning preserves per-channel LR structure
+        # and avoids the over-smoothing seen with single pooled-token keys.
+        cond_context = cond_tokens
+        if cond_context is None:
+            if cond_pooled is None:
+                raise ValueError("Both cond_tokens and cond_pooled are None")
+            cond_context = cond_pooled.unsqueeze(1)
+
+        if cond_context.dim() != 3:
+            raise ValueError(
+                f"Expected cond_tokens to have shape (B, tokens, dim), got {tuple(cond_context.shape)}"
+            )
+
+        if cond_context.size(0) != B:
+            raise ValueError(
+                f"Conditioning batch size {cond_context.size(0)} does not match latent batch size {B}"
+            )
+
+        if cond_context.shape[-1] != self.cond_dim:
+            raise ValueError(
+                f"Conditioning feature dim {cond_context.shape[-1]} does not match cond_dim {self.cond_dim}"
+            )
+        cond_context = self.cond_proj(cond_context)
         
         # Apply cross-attention layers
         for i, (cross_attn, norm) in enumerate(zip(self.cross_attn_layers, self.norm_cross)):
-            # Cross-attention: query=latent patches, key/value=LR conditioning
+            # Cross-attention: query=latent patches, key/value=LR conditioning tokens
             x_attended, _ = cross_attn(
                 query=x,                # (B, num_patches, latent_dim)
-                key=cond_tokens,        # (B, lr_channels, latent_dim)
-                value=cond_tokens
+                key=cond_context,       # (B, lr_tokens, latent_dim)
+                value=cond_context
             )
             x = norm(x + x_attended)  # Residual connection + norm
         
