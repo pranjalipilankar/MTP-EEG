@@ -487,11 +487,11 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
             if device.type == 'cuda':
                 with torch.amp.autocast('cuda'):
                     diff_loss, pred_sr = stad_model(lr_eeg, hr_eeg, sr_eeg)
-                    sr_loss = F.l1_loss(pred_sr.float(), sr_eeg.float())
+                    sr_loss = F.mse_loss(pred_sr.float(), sr_eeg.float())
                     total_loss = diff_loss + args.sr_loss_weight * sr_loss
             else:
                 diff_loss, pred_sr = stad_model(lr_eeg, hr_eeg, sr_eeg)
-                sr_loss = F.l1_loss(pred_sr.float(), sr_eeg.float())
+                sr_loss = F.mse_loss(pred_sr.float(), sr_eeg.float())
                 total_loss = diff_loss + args.sr_loss_weight * sr_loss
 
             if not torch.isfinite(total_loss):
@@ -527,11 +527,11 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
                 if device.type == 'cuda':
                     with torch.amp.autocast('cuda'):
                         val_diff_loss, val_pred_sr = stad_model(lr_eeg, hr_eeg, sr_eeg)
-                        val_sr_loss = F.l1_loss(val_pred_sr.float(), sr_eeg.float())
+                        val_sr_loss = F.mse_loss(val_pred_sr.float(), sr_eeg.float())
                         val_total_loss = val_diff_loss + args.sr_loss_weight * val_sr_loss
                 else:
                     val_diff_loss, val_pred_sr = stad_model(lr_eeg, hr_eeg, sr_eeg)
-                    val_sr_loss = F.l1_loss(val_pred_sr.float(), sr_eeg.float())
+                    val_sr_loss = F.mse_loss(val_pred_sr.float(), sr_eeg.float())
                     val_total_loss = val_diff_loss + args.sr_loss_weight * val_sr_loss
 
                 if not torch.isfinite(val_total_loss):
@@ -733,7 +733,7 @@ def main():
     parser.add_argument('--min_lr', type=float, default=1e-6,
                        help='Minimum learning rate')
     parser.add_argument('--sr_loss_weight', type=float, default=0.1,
-                       help='Weight for supervised SR reconstruction L1 loss')
+                       help='Weight for supervised SR reconstruction L2 loss')
     parser.add_argument('--diffusion_schedule', type=str, default='cosine',
                        choices=['linear', 'cosine'],
                        help='Beta schedule for diffusion process')

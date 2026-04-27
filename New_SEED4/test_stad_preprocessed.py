@@ -86,14 +86,14 @@ def create_split(n_folds=5, test_fold=0):
 class SEED4PreprocessedDataset(Dataset):
     """Loader for preprocessed SEED-IV folder structure."""
 
-    def __init__(self, data_path, subjects, lr_channels=16, hr_channels=31):
+    def __init__(self, data_path, subjects=None, lr_channels=16, hr_channels=31):
         self.lr_indices = get_seed4_channel_indices(lr_channels)
         self.hr_indices = get_seed4_channel_indices(hr_channels)
 
         data_path = Path(data_path)
 
         if data_path.is_file() and data_path.suffix == '.npz':
-            self._load_from_npz(data_path)
+            self._load_from_npz(data_path, subjects=subjects)
             return
 
         all_windows = []
@@ -162,56 +162,128 @@ class SEED4PreprocessedDataset(Dataset):
 
         print(f"Loaded {len(self.sr_samples)} test windows from subjects {subjects}")
 
-    def _load_from_npz(self, npz_path):
+    def _load_from_npz(self, npz_path, subjects=None):
         """Load test data from npz payload (supports multiple key layouts)."""
         payload = np.load(npz_path, allow_pickle=True)
 
         if 'SR' in payload:
             sr_all = payload['SR'].astype(np.float32)
             if 'test_indices' in payload:
-                idx = payload['test_indices'].astype(int)
-                sr = sr_all[idx]
+                base_idx = payload['test_indices'].astype(int)
             else:
-                sr = sr_all
+                base_idx = np.arange(len(sr_all), dtype=int)
+            sr = sr_all[base_idx]
         elif 'X_test' in payload:
             sr = payload['X_test'].astype(np.float32)
+            base_idx = np.arange(len(sr), dtype=int)
         else:
             raise KeyError(
                 f"Unsupported npz format: {npz_path}. Expected SR (+optional test_indices) or X_test key."
             )
 
+        n = len(sr)
+        if 'subject_ids' in payload:
+            subject_all = np.asarray(payload['subject_ids']).astype(str)
+            if len(subject_all) == len(base_idx):
+                subject_ids = subject_all
+            elif len(subject_all) > np.max(base_idx):
+                subject_ids = subject_all[base_idx]
+            elif len(subject_all) >= n:
+                subject_ids = subject_all[:n]
+            else:
+                subject_ids = np.array([f'unknown_{i:05d}' for i in range(n)])
+        else:
+            subject_ids = np.array([f'unknown_{i:05d}' for i in range(n)])
+
+        if 'session_ids' in payload:
+            session_all = np.asarray(payload['session_ids']).astype(str)
+            if len(session_all) == len(base_idx):
+                session_ids = session_all
+            elif len(session_all) > np.max(base_idx):
+                session_ids = session_all[base_idx]
+            elif len(session_all) >= n:
+                session_ids = session_all[:n]
+            else:
+                session_ids = np.array(['1'] * n)
+        else:
+            session_ids = np.array(['1'] * n)
+
+        if 'trial_ids' in payload:
+            trial_all = np.asarray(payload['trial_ids'])
+            if len(trial_all) == len(base_idx):
+                trial_ids = trial_all.astype(int)
+            elif len(trial_all) > np.max(base_idx):
+                trial_ids = trial_all[base_idx].astype(int)
+            elif len(trial_all) >= n:
+                trial_ids = trial_all[:n].astype(int)
+            else:
+                trial_ids = np.arange(n, dtype=int)
+        else:
+            if 'labels' in payload:
+                labels_all = np.asarray(payload['labels'])
+                if len(labels_all) == len(base_idx):
+                    labels = labels_all
+                elif len(labels_all) > np.max(base_idx):
+                    labels = labels_all[base_idx]
+                elif len(labels_all) >= n:
+                    labels = labels_all[:n]
+                else:
+                    labels = None
+
+                if labels is not None and len(labels) == n:
+                    trial_ids = np.zeros(n, dtype=int)
+                    running_trial = {}
+                    last_label = {}
+                    for i in range(n):
+                        subj = str(subject_ids[i])
+                        lab = int(labels[i])
+                        if subj not in running_trial:
+                            running_trial[subj] = 0
+                            last_label[subj] = lab
+                            trial_ids[i] = 0
+                            continue
+                        if lab != last_label[subj]:
+                            running_trial[subj] += 1
+                            last_label[subj] = lab
+                        trial_ids[i] = running_trial[subj]
+                    print(
+                        "Info: trial_ids missing in npz; inferred trial boundaries from label transitions "
+                        "within each subject."
+                    )
+                else:
+                    trial_ids = np.arange(n, dtype=int)
+            else:
+                trial_ids = np.arange(n, dtype=int)
+
+        if subjects is not None:
+            wanted = np.array([str(s) for s in subjects])
+            mask = np.isin(subject_ids, wanted)
+            if np.any(mask):
+                sr = sr[mask]
+                subject_ids = subject_ids[mask]
+                session_ids = session_ids[mask]
+                trial_ids = trial_ids[mask]
+                print(
+                    f"Loaded {len(sr)} test windows from npz after subject filtering "
+                    f"({len(wanted)} subjects): {npz_path}"
+                )
+            else:
+                available = sorted(np.unique(subject_ids).tolist())[:20]
+                raise ValueError(
+                    f"No npz samples matched requested test subjects {subjects}. "
+                    f"Available subject_ids examples: {available}"
+                )
+        else:
+            print(f"Loaded {len(sr)} test windows from npz: {npz_path}")
+
         self.sr_samples = sr
         self.hr_samples = sr[:, self.hr_indices, :]
         self.lr_samples = sr[:, self.lr_indices, :]
+        self.subject_ids = subject_ids
+        self.session_ids = session_ids
+        self.trial_ids = trial_ids.astype(int)
         self.norm_stats = None
         self.prc1_meta = None
-
-        n = len(sr)
-        if 'subject_ids' in payload and len(payload['subject_ids']) >= n:
-            if 'test_indices' in payload:
-                self.subject_ids = np.asarray(payload['subject_ids'])[payload['test_indices']].astype(str)
-            else:
-                self.subject_ids = np.asarray(payload['subject_ids'][:n]).astype(str)
-        else:
-            self.subject_ids = np.array([f'unknown_{i:05d}' for i in range(n)])
-
-        if 'session_ids' in payload and len(payload['session_ids']) >= n:
-            if 'test_indices' in payload:
-                self.session_ids = np.asarray(payload['session_ids'])[payload['test_indices']].astype(str)
-            else:
-                self.session_ids = np.asarray(payload['session_ids'][:n]).astype(str)
-        else:
-            self.session_ids = np.array(['1'] * n)
-
-        if 'trial_ids' in payload and len(payload['trial_ids']) >= n:
-            if 'test_indices' in payload:
-                self.trial_ids = np.asarray(payload['trial_ids'])[payload['test_indices']].astype(int)
-            else:
-                self.trial_ids = np.asarray(payload['trial_ids'][:n]).astype(int)
-        else:
-            self.trial_ids = np.arange(n, dtype=int)
-
-        print(f"Loaded {n} test windows from npz: {npz_path}")
 
     def __len__(self):
         return len(self.sr_samples)
@@ -290,6 +362,44 @@ def save_eeg_signal_figure(pred_sr, target_sr, lr_eeg, out_path, sample_idx, cha
     plt.close(fig)
 
 
+def _npz_has_built_in_test_split(npz_path):
+    """Return True if NPZ already defines test subset or explicit test tensor."""
+    try:
+        payload = np.load(npz_path, allow_pickle=True)
+        return ('test_indices' in payload) or ('X_test' in payload)
+    except Exception:
+        return False
+
+
+def save_grouped_outputs(pred_sr, target_sr, subject_ids, session_ids, trial_ids, output_root):
+    """Save outputs grouped by session/subject/trial in a raw-data-like hierarchy."""
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    groups = {}
+    for idx, (subj, sess, trial) in enumerate(zip(subject_ids, session_ids, trial_ids)):
+        key = (str(sess), str(subj), int(trial))
+        groups.setdefault(key, []).append(idx)
+
+    for (sess, subj, trial), indices in groups.items():
+        trial_dir = output_root / str(sess) / f'subject_{subj}' / f'trial_{int(trial):02d}'
+        trial_dir.mkdir(parents=True, exist_ok=True)
+        idx_arr = np.asarray(indices, dtype=int)
+        np.save(trial_dir / 'pred_sr.npy', pred_sr[idx_arr])
+        np.save(trial_dir / 'target_sr.npy', target_sr[idx_arr])
+        np.savez(
+            trial_dir / 'meta.npz',
+            indices=idx_arr,
+            subject_id=np.array([subj]),
+            session_id=np.array([sess]),
+            trial_id=np.array([int(trial)], dtype=int),
+        )
+
+    print(
+        f"Saved grouped outputs for {len(groups)} session/subject/trial groups -> {output_root}"
+    )
+
+
 def evaluate(args):
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -302,9 +412,28 @@ def evaluate(args):
             print(f"Info: {data_path} not found, using {fallback}")
             data_path = fallback
 
-    splits = create_split(n_folds=5, test_fold=args.test_fold)
-    test_subjects = splits['test']
-    print(f"Test subjects: {test_subjects}")
+    test_subjects = None
+    use_fold_split = True
+    data_path_obj = Path(data_path)
+    if data_path_obj.is_file() and data_path_obj.suffix == '.npz':
+        has_npz_test_split = _npz_has_built_in_test_split(data_path_obj)
+        if has_npz_test_split and not args.force_fold_subject_filter:
+            use_fold_split = False
+            print('Using NPZ-provided test subset directly (no fold subject filtering).')
+        elif not has_npz_test_split:
+            if args.allow_potential_leakage:
+                use_fold_split = False
+                print('Warning: NPZ has no explicit test split; evaluating full NPZ (potential leakage).')
+            else:
+                use_fold_split = True
+                print('NPZ has no explicit test split; using fold subject filter to avoid leakage.')
+
+    if use_fold_split:
+        splits = create_split(n_folds=5, test_fold=args.test_fold)
+        test_subjects = splits['test']
+        print(f"Test subjects: {test_subjects}")
+    else:
+        print('Test subjects: inferred from NPZ test payload')
 
     dataset = SEED4PreprocessedDataset(
         data_path=data_path,
@@ -473,6 +602,21 @@ def evaluate(args):
                     json.dump(dataset.prc1_meta, f, indent=2)
                 print(f"Saved PrC-1 meta: {meta_json_path}")
 
+    if args.save_grouped_output_dir:
+        if not saved_pred_sr or not saved_target_sr:
+            print('Warning: no predictions collected, grouped output not saved.')
+        else:
+            pred_group = np.concatenate(saved_pred_sr, axis=0)
+            target_group = np.concatenate(saved_target_sr, axis=0)
+            save_grouped_outputs(
+                pred_sr=pred_group,
+                target_sr=target_group,
+                subject_ids=np.array(saved_subject_ids),
+                session_ids=np.array(saved_session_ids),
+                trial_ids=np.array(saved_trial_ids, dtype=int),
+                output_root=args.save_grouped_output_dir,
+            )
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Test STAD on SEED-IV preprocessed data')
@@ -486,6 +630,10 @@ if __name__ == '__main__':
                         help='Path to trained STAD checkpoint')
     parser.add_argument('--test_fold', type=int, default=0,
                         help='Fold index used for test split (same as training)')
+    parser.add_argument('--force_fold_subject_filter', action='store_true',
+                        help='Force fold-based subject filtering even for npz files with test_indices/X_test')
+    parser.add_argument('--allow_potential_leakage', action='store_true',
+                        help='Allow evaluating full npz when no explicit test split exists (not recommended)')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size for testing')
     parser.add_argument('--num_workers', type=int, default=4,
@@ -514,5 +662,7 @@ if __name__ == '__main__':
                         help='Optional path to save PrC-1 norm stats (.npy) for reconstruction reversal')
     parser.add_argument('--save_prc1_meta_path', type=str, default='',
                         help='Optional path to save PrC-1 meta (.json) for reconstruction reversal')
+    parser.add_argument('--save_grouped_output_dir', type=str, default='',
+                        help='Optional root dir to save outputs grouped by session/subject/trial')
 
     evaluate(parser.parse_args())
