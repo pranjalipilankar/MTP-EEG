@@ -680,7 +680,7 @@ def train_stad_localizemi(
     pin_memory=False,
     persistent_workers=False,
     preprocessed=True,
-    loss_weights={'diff': 1.0, 'sr_l1': 0.5},
+    loss_weights={'diff': 1.0, 'sr_l2': 0.5},
 ):
     """
     Train STAD on Localize-MI dataset.
@@ -726,7 +726,7 @@ def train_stad_localizemi(
     metrics_path = run_dir / 'metrics_history_localizemi.npy'
 
     diff_weight = float(loss_weights.get('diff', 1.0))
-    sr_l1_weight = float(loss_weights.get('sr_l1', loss_weights.get('recon_mse', 0.5)))
+    sr_l2_weight = float(loss_weights.get('sr_l2', loss_weights.get('recon_mse', 0.5)))
 
     print("=" * 60)
     print("STAD Training - Localize-MI HD-EEG Dataset (256 channels, 8000Hz)")
@@ -734,8 +734,8 @@ def train_stad_localizemi(
     print("=" * 60)
     print(f"\nLoss Weights (SEED4-style objective):")
     print(f"   Diffusion:      {diff_weight:.2f}")
-    print(f"   SR L1:          {sr_l1_weight:.2f}")
-    print("   Total:          diff + sr_l1_weight * sr_l1\n")
+    print(f"   SR L2:          {sr_l2_weight:.2f}")
+    print("   Total:          diff + sr_l2_weight * sr_l2\n")
     print(f"Dataset mode: {'preprocessed (X_prc1.npy)' if preprocessed else 'raw epochs (*_epochs.npy)'}")
 
     # ── Dataset splits (match MAE fold subjects to prevent leakage) ────────────
@@ -1003,6 +1003,7 @@ def train_stad_localizemi(
                 lr_pos = get_channel_positions(64, device, B)
                 pred_epsilon = model(x_lr, zt, t, lr_pos)
 
+
                 if torch.isnan(pred_epsilon).any():
                     print(f"\n⚠️  NaN in prediction at batch {batch_idx} - skipping")
                     nan_batches += 1
@@ -1017,7 +1018,7 @@ def train_stad_localizemi(
                 sr_pred = model.decode_latent_to_sr(pred_z0, x_lr)
                 sr_l2 = F.mse_loss(sr_pred.float(), y_sr.float())
 
-                loss = diff_weight * diff_loss + sr_l1_weight * sr_l2
+                loss = diff_weight * diff_loss + sr_l2_weight * sr_l2
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"\n⚠️  NaN/Inf loss at batch {batch_idx} - skipping")
@@ -1124,7 +1125,7 @@ def train_stad_localizemi(
                 pred_z0 = torch.clamp(pred_z0, min=-10.0, max=10.0)
                 sr_pred_val = model.decode_latent_to_sr(pred_z0, x_lr)
                 sr_l2_val = F.mse_loss(sr_pred_val.float(), y_sr.float())
-                loss_val = diff_weight * diff_val + sr_l1_weight * sr_l2_val
+                loss_val = diff_weight * diff_val + sr_l2_weight * sr_l2_val
 
                 if not (torch.isnan(loss_val) or torch.isinf(loss_val)):
                     val_loss += loss_val.item()
@@ -1194,7 +1195,7 @@ def train_stad_localizemi(
                 'mae_fold': mae_fold,
                 'train_subjects': train_subjects,
                 'val_subjects': val_subjects,
-                'loss_weights': {'diff': diff_weight, 'sr_l1': sr_l1_weight},
+                'loss_weights': {'diff': diff_weight, 'sr_l2': sr_l2_weight},
                 'dataset_info': 'Motor Imagery (MI) - hand/foot movement imagination',
                 'mi_bands': 'Beta (13-30 Hz) ERD/ERS, Mu (8-13 Hz) motor cortex',
             },
@@ -1250,13 +1251,13 @@ if __name__ == '__main__':
                         help='Use raw epochs from derivatives/epochs (sub-*/eeg/*_epochs.npy) instead of preprocessed X_prc1.npy')
     parser.add_argument('--diff_weight', type=float, default=1.0,
                         help='Weight for diffusion loss')
-    parser.add_argument('--sr_l1_weight', type=float, default=0.5,
+    parser.add_argument('--sr_l2_weight', type=float, default=0.5,
                         help='Weight for SR L1 reconstruction loss (SEED4-style objective)')
     args = parser.parse_args()
 
     loss_weights = {
         'diff': args.diff_weight,
-        'sr_l1': args.sr_l1_weight,
+        'sr_l2': args.sr_l2_weight,
     }
 
     train_stad_localizemi(
