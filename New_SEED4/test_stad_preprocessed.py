@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate STAD checkpoint on SEED-IV preprocessed data."""
+"""Evaluate STAD checkpoint on SEED-IV preprocessed data with enhanced visualizations."""
 
 import argparse
 import json
@@ -11,6 +11,17 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from scipy.signal import butter, filtfilt
+from scipy.fft import fft
+
+try:
+    import mne
+    from mne.time_frequency import psd_array_multitaper
+    HAS_MNE = True
+except ImportError:
+    HAS_MNE = False
+    print("Warning: MNE not available. Topomap visualizations disabled.")
 
 from mae_for_eeg import MAEforEEG
 from stad_model_CORRECT import STADModel
@@ -60,6 +71,294 @@ def compute_sr_metrics(pred_sr, target_sr, eps=1e-8):
         'nmse': nmse,
         'snr': snr,
     }
+
+
+# ============================================================================
+# ENHANCED: Dataset Statistics & Validation
+# ============================================================================
+
+def compute_dataset_statistics(dataset, sample_size=None):
+    """Compute comprehensive dataset statistics for validation."""
+    if sample_size is None:
+        sample_size = min(100, len(dataset))
+    
+    sr_samples = []
+    lr_samples = []
+    hr_samples = []
+    signal_ranges = []
+    
+    for i in range(sample_size):
+        batch = dataset[i]
+        sr_samples.append(batch['sr'].numpy())
+        lr_samples.append(batch['lr'].numpy())
+        hr_samples.append(batch['hr'].numpy())
+        signal_ranges.append(batch['sr'].numpy().max() - batch['sr'].numpy().min())
+    
+    sr_data = np.concatenate(sr_samples, axis=0)
+    lr_data = np.concatenate(lr_samples, axis=0)
+    hr_data = np.concatenate(hr_samples, axis=0)
+    
+    stats = {
+        'sr': {
+            'shape': sr_data.shape,
+            'mean': sr_data.mean(),
+            'std': sr_data.std(),
+            'min': sr_data.min(),
+            'max': sr_data.max(),
+            'channels': sr_data.shape[0],
+        },
+        'lr': {
+            'shape': lr_data.shape,
+            'mean': lr_data.mean(),
+            'std': lr_data.std(),
+            'min': lr_data.min(),
+            'max': lr_data.max(),
+            'channels': lr_data.shape[0],
+        },
+        'hr': {
+            'shape': hr_data.shape,
+            'mean': hr_data.mean(),
+            'std': hr_data.std(),
+            'min': hr_data.min(),
+            'max': hr_data.max(),
+            'channels': hr_data.shape[0],
+        },
+        'total_samples': len(dataset),
+        'sampled_count': sample_size,
+        'signal_range_mean': np.mean(signal_ranges),
+        'signal_range_std': np.std(signal_ranges),
+    }
+    
+    return stats
+
+
+def print_dataset_report(stats):
+    """Print formatted dataset statistics report."""
+    print('\n' + '='*80)
+    print('DATASET STATISTICS REPORT')
+    print('='*80)
+    print(f"Total Samples: {stats['total_samples']} (analyzed: {stats['sampled_count']})")
+    print(f"Signal Range: {stats['signal_range_mean']:.4f} ± {stats['signal_range_std']:.4f}")
+    
+    for key in ['lr', 'hr', 'sr']:
+        d = stats[key]
+        print(f"\n{key.upper()} EEG:")
+        print(f"  Shape: {d['shape']}")
+        print(f"  Channels: {d['channels']}")
+        print(f"  Mean: {d['mean']:.6f}, Std: {d['std']:.6f}")
+        print(f"  Range: [{d['min']:.6f}, {d['max']:.6f}]")
+
+
+# ============================================================================
+# ENHANCED: Visualization Functions
+# ============================================================================
+
+def compute_psd_batch(eeg_data, fs=128, fmin=0.5, fmax=45, nperseg=256):
+    """Compute power spectral density for batch of signals."""
+    from scipy import signal
+    
+    psds = []
+    for ch_data in eeg_data:
+        f, psd = signal.welch(ch_data, fs=fs, nperseg=min(nperseg, len(ch_data)),
+                              scaling='density')
+        mask = (f >= fmin) & (f <= fmax)
+        psds.append(psd[mask])
+    
+    return np.array(psds), f[mask]
+
+
+def extract_band_power(eeg_data, fs=128, freq_ranges=None):
+    """Extract power in frequency bands."""
+    if freq_ranges is None:
+        freq_ranges = {
+            'δ (0.5-4 Hz)': (0.5, 4),
+            'θ (4-8 Hz)': (4, 8),
+            'α (8-13 Hz)': (8, 13),
+            'β (13-30 Hz)': (13, 30),
+            'γ (30-45 Hz)': (30, 45),
+        }
+    
+    psd, freqs = compute_psd_batch(eeg_data, fs=fs)
+    
+    band_powers = {}
+    for band_name, (fmin, fmax) in freq_ranges.items():
+        mask = (freqs >= fmin) & (freqs <= fmax)
+        band_powers[band_name] = np.mean(psd[:, mask], axis=1)
+    
+    return band_powers
+
+
+def save_metric_distributions_plot(pcc_scores, nmse_scores, snr_scores, out_path):
+    """Save histograms of evaluation metrics."""
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    
+    # PCC distribution
+    axes[0].hist(pcc_scores, bins=30, color='steelblue', alpha=0.7, edgecolor='black')
+    axes[0].axvline(np.mean(pcc_scores), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(pcc_scores):.4f}')
+    axes[0].set_xlabel('PCC Score')
+    axes[0].set_ylabel('Frequency')
+    axes[0].set_title('PCC Distribution')
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+    
+    # NMSE distribution
+    axes[1].hist(nmse_scores, bins=30, color='coral', alpha=0.7, edgecolor='black')
+    axes[1].axvline(np.mean(nmse_scores), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(nmse_scores):.4f}')
+    axes[1].set_xlabel('NMSE Score')
+    axes[1].set_ylabel('Frequency')
+    axes[1].set_title('NMSE Distribution')
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+    
+    # SNR distribution
+    axes[2].hist(snr_scores, bins=30, color='mediumseagreen', alpha=0.7, edgecolor='black')
+    axes[2].axvline(np.mean(snr_scores), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(snr_scores):.2f} dB')
+    axes[2].set_xlabel('SNR (dB)')
+    axes[2].set_ylabel('Frequency')
+    axes[2].set_title('SNR Distribution')
+    axes[2].legend()
+    axes[2].grid(alpha=0.3)
+    
+    fig.suptitle('Evaluation Metrics Distribution', fontsize=14, fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Saved metrics distribution: {out_path}")
+
+
+def save_loss_curves_plot(diff_losses, sr_losses, out_path):
+    """Save loss curves over batches."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    
+    # Filter out NaN values for diff_loss
+    diff_losses_filtered = [l for l in diff_losses if not np.isnan(l)]
+    
+    # Diffusion loss
+    if diff_losses_filtered:
+        axes[0].plot(diff_losses_filtered, linewidth=1.5, color='steelblue', label='Diff Loss')
+        axes[0].fill_between(range(len(diff_losses_filtered)), diff_losses_filtered, alpha=0.3, color='steelblue')
+        axes[0].set_ylabel('Loss')
+        axes[0].set_xlabel('Batch')
+        axes[0].set_title('Diffusion Loss Over Batches')
+        axes[0].grid(alpha=0.3)
+        axes[0].legend()
+    else:
+        axes[0].text(0.5, 0.5, 'No diffusion loss (sampling mode)', ha='center', va='center',
+                    transform=axes[0].transAxes, fontsize=12, color='gray')
+    
+    # SR L1 loss
+    axes[1].plot(sr_losses, linewidth=1.5, color='coral', label='SR L1 Loss')
+    axes[1].fill_between(range(len(sr_losses)), sr_losses, alpha=0.3, color='coral')
+    axes[1].set_ylabel('Loss')
+    axes[1].set_xlabel('Batch')
+    axes[1].set_title('SR L1 Loss Over Batches')
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+    
+    fig.suptitle('Training/Evaluation Curves', fontsize=14, fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Saved loss curves: {out_path}")
+
+
+def save_comparison_plot(pred_sr, target_sr, channels_to_plot, out_path):
+    """Save side-by-side comparison of predictions vs targets."""
+    n_samples = min(3, pred_sr.shape[0])
+    n_channels = len(channels_to_plot)
+    
+    fig, axes = plt.subplots(n_samples, n_channels, figsize=(16, 4*n_samples))
+    if n_samples == 1:
+        axes = axes.reshape(1, -1)
+    
+    for sample_idx in range(n_samples):
+        for ch_idx, ch in enumerate(channels_to_plot):
+            ax = axes[sample_idx, ch_idx]
+            
+            pred_signal = pred_sr[sample_idx, ch, :]
+            target_signal = target_sr[sample_idx, ch, :]
+            
+            ax.plot(target_signal, label='Target', linewidth=1.5, color='black', alpha=0.7)
+            ax.plot(pred_signal, label='Predicted', linewidth=1.5, color='steelblue', alpha=0.7)
+            
+            ax.set_title(f'Sample {sample_idx}, Ch {ch}')
+            ax.set_ylabel('Amplitude (μV)')
+            ax.grid(alpha=0.3)
+            if sample_idx == 0 and ch_idx == 0:
+                ax.legend(loc='upper right')
+    
+    axes[-1, 0].set_xlabel('Time Samples')
+    fig.suptitle('Predicted vs Target EEG Signals', fontsize=14, fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Saved comparison plot: {out_path}")
+
+
+# Topomap-specific functions
+def save_topomap_visualization(pred_sr, target_sr, out_path, n_channels=62):
+    """Generate and save topomap visualizations if MNE available."""
+    if not HAS_MNE:
+        print("Skipping topomap visualization (MNE not available)")
+        return
+    
+    try:
+        # Use first sample
+        pred_sample = pred_sr[0] if pred_sr.ndim > 2 else pred_sr
+        target_sample = target_sr[0] if target_sr.ndim > 2 else target_sr
+        
+        if pred_sample.ndim == 2:
+            pred_sample = pred_sample.mean(axis=1)
+        if target_sample.ndim == 2:
+            target_sample = target_sample.mean(axis=1)
+        
+        # Create mock info
+        ch_names = [f'E{i+1}' for i in range(n_channels)]
+        fs = 128
+        info = mne.create_info(ch_names, fs, ch_types='eeg')
+        
+        # Generate synthetic electrode positions (circle)
+        angles = np.linspace(0, 2*np.pi, n_channels, endpoint=False)
+        radius = 0.5
+        pos_x = radius * np.cos(angles)
+        pos_y = radius * np.sin(angles)
+        pos_z = np.zeros(n_channels)
+        
+        pos_dict = {ch: np.array([x, y, z]) 
+                   for ch, x, y, z in zip(ch_names, pos_x, pos_y, pos_z)}
+        montage = mne.channels.make_dig_montage(ch_pos=pos_dict, coord_frame='head')
+        info.set_montage(montage)
+        
+        # Create comparison figure
+        fig = plt.figure(figsize=(12, 5))
+        
+        # Target topomap
+        ax1 = plt.subplot(1, 2, 1)
+        im1, _ = mne.viz.plot_topomap(target_sample, info, axes=ax1, show=False,
+                                      cmap='RdBu_r', contours=6, outlines='head',
+                                      sensors=True, vmin=target_sample.min(), 
+                                      vmax=target_sample.max())
+        ax1.set_title('Target SR (Ground Truth)', fontsize=12, fontweight='bold')
+        plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label='Amplitude (μV)')
+        
+        # Predicted topomap
+        ax2 = plt.subplot(1, 2, 2)
+        im2, _ = mne.viz.plot_topomap(pred_sample, info, axes=ax2, show=False,
+                                      cmap='RdBu_r', contours=6, outlines='head',
+                                      sensors=True, vmin=target_sample.min(),
+                                      vmax=target_sample.max())
+        ax2.set_title('Predicted SR (Model Output)', fontsize=12, fontweight='bold')
+        plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04, label='Amplitude (μV)')
+        
+        fig.suptitle('EEG Topographic Map Comparison', fontsize=14, fontweight='bold', y=1.02)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"✅ Saved topomap visualization: {out_path}")
+        
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to generate topomap: {e}")
+
 
 
 def create_split(n_folds=5, test_fold=0):
@@ -448,6 +747,14 @@ def evaluate(args):
         num_workers=args.num_workers,
     )
 
+    # ✅ ENHANCED: Print dataset statistics
+    print("\n" + "="*80)
+    print("Computing Dataset Statistics...")
+    print("="*80)
+    dataset_stats = compute_dataset_statistics(dataset, sample_size=min(50, len(dataset)))
+    print_dataset_report(dataset_stats)
+
+
     mae_encoder = build_mae_encoder(args.mae_checkpoint, device)
 
     model = STADModel(
@@ -558,6 +865,38 @@ def evaluate(args):
     if fig_dir is not None:
         print(f"Saved EEG figures: {saved_figures} -> {fig_dir}")
 
+    # ✅ ENHANCED: Generate comprehensive visualizations
+    print('\n' + '=' * 80)
+    print('Generating Comprehensive Visualizations...')
+    print('=' * 80)
+    
+    viz_dir = Path(args.visualization_dir)
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save metric distributions
+    if pcc_scores and nmse_scores and snr_scores:
+        metric_dist_path = viz_dir / 'metrics_distribution.png'
+        save_metric_distributions_plot(pcc_scores, nmse_scores, snr_scores, str(metric_dist_path))
+    
+    # Save loss curves
+    loss_curves_path = viz_dir / 'loss_curves.png'
+    save_loss_curves_plot(diff_losses, sr_losses, str(loss_curves_path))
+    
+    # Save comparison plots
+    if saved_pred_sr and saved_target_sr:
+        channels_to_plot_cmp = [0, 15, 31, 45, 61]
+        comp_path = viz_dir / 'eeg_comparison.png'
+        pred_all = np.concatenate(saved_pred_sr, axis=0)
+        target_all = np.concatenate(saved_target_sr, axis=0)
+        save_comparison_plot(pred_all, target_all, channels_to_plot_cmp, str(comp_path))
+        
+        # Save topomap
+        topomap_path = viz_dir / 'topomap_comparison.png'
+        save_topomap_visualization(pred_all, target_all, str(topomap_path), n_channels=62)
+    
+    print(f"✅ All visualizations saved to: {viz_dir}")
+
+
     if args.save_sr_output_path:
         sr_out = np.concatenate(saved_pred_sr, axis=0)
         save_path = Path(args.save_sr_output_path)
@@ -652,6 +991,8 @@ if __name__ == '__main__':
                         help='Directory to save EEG signal figures (empty to disable)')
     parser.add_argument('--num_fig_samples', type=int, default=3,
                         help='How many samples to plot as EEG figures')
+    parser.add_argument('--visualization_dir', type=str, default='test_visualizations',
+                        help='Directory to save comprehensive visualizations (metrics, loss curves, topomaps)')
     parser.add_argument('--save_sr_output_path', type=str, default='',
                         help='Optional path to save predicted SR EEG windows (.npy)')
     parser.add_argument('--save_target_output_path', type=str, default='',

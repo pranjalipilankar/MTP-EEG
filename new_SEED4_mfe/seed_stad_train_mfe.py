@@ -240,6 +240,24 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
     start_epoch = 0
     mae_unfrozen = False
 
+    if args.resume_stad_checkpoint and os.path.exists(args.resume_stad_checkpoint):
+        print(f"\n🔁 Resuming from checkpoint: {args.resume_stad_checkpoint}")
+        checkpoint = torch.load(args.resume_stad_checkpoint, map_location=device)
+
+        stad_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        start_epoch = checkpoint.get('epoch', 0)
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+
+        if args.resume_optimizer:
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        print(f"✅ Resumed from epoch {start_epoch}")
+
     for epoch in range(start_epoch, args.epochs):
         if (args.freeze_mae and not mae_unfrozen and args.unfreeze_mae_epoch >= 0 
             and epoch >= args.unfreeze_mae_epoch):
@@ -407,10 +425,23 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': stad_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'best_val_loss': best_val_loss,
-                'val_loss': val_loss,
+                'scaler_state_dict': scaler.state_dict(),
             }, save_path)
             print(f"  ✅ Saved best model → {save_path}")
+
+        # ALWAYS save last checkpoint (for resume)
+        last_ckpt_path = output_dir / 'last_checkpoint.pth'
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': stad_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_val_loss': best_val_loss,
+            'scaler_state_dict': scaler.state_dict(),
+        }, last_ckpt_path)
 
         history.append({
             'epoch': epoch + 1,

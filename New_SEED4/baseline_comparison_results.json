@@ -1,0 +1,25 @@
+{
+  "baseline": {
+    "method": "Linear Interpolation",
+    "pcc": 0.6192605495452881,
+    "nmse": 0.6504136919975281,
+    "snr_db": 2.0409092903137207
+  },
+  "stad": {
+    "method": "STAD Model",
+    "pcc": 0.05026622116565704,
+    "nmse": 0.995586097240448,
+    "snr_db": 0.021801471710205078
+  },
+  "comparison": {
+    "pcc_diff": -0.5689943432807922,
+    "nmse_diff": 0.3451724052429199,
+    "snr_diff": -2.0191078186035156
+  },
+  "test_samples": 1407,
+  "test_subjects": [
+    "7",
+    "10",
+    "15"
+  ]
+}
