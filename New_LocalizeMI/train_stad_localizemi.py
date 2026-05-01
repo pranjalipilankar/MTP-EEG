@@ -220,7 +220,7 @@ def psd_loss(pred, target, fs=500):
 def validate_with_metrics(model, val_loader, device, diff_params, T=1000, num_samples=100):
     """
     Comprehensive validation with NMSE, PCC, SNR metrics.
-    Performs DDIM sampling to reconstruct HR latents and decodes them through MAE decoder.
+    Mirrors the teacher-forced validation path used in training.
     """
     model.eval()
     all_nmse = []
@@ -237,49 +237,28 @@ def validate_with_metrics(model, val_loader, device, diff_params, T=1000, num_sa
         y_sr = batch['sr'].to(device)
         B = x_lr.size(0)
 
-        # Encode ground truth SR to latent (via SR->HR projection)
-        z0_true = model.encode_sr(y_sr)  # (B, 175, 1024)
+        if torch.isnan(x_lr).any() or torch.isnan(y_sr).any():
+            continue
 
-        # DDIM sampling with 50 steps
-        ddim_steps = 50
-        ddim_eta = 0.0
-        timesteps = torch.linspace(T-1, 0, ddim_steps, dtype=torch.long, device=device)
+        z0 = model.encode_sr(y_sr)
+        if torch.isnan(z0).any():
+            continue
 
-        # Start from noise
-        zt = torch.randn_like(z0_true)
+        z0 = torch.clamp(z0, min=-10.0, max=10.0)
+        t = torch.randint(0, T, (B,), device=device)
+        epsilon = torch.randn_like(z0)
+        sqrt_alpha = diff_params['sqrt_alphas_cumprod'][t].view(B, 1, 1)
+        sqrt_one_minus = diff_params['sqrt_one_minus_alphas_cumprod'][t].view(B, 1, 1)
+        zt = sqrt_alpha * z0 + sqrt_one_minus * epsilon
+
         lr_pos = get_channel_positions(64, device, B)
+        pred_epsilon = model(x_lr, zt, t, lr_pos)
+        if torch.isnan(pred_epsilon).any():
+            continue
 
-        # DDIM reverse process
-        for i, t in enumerate(timesteps):
-            t_batch = torch.full((B,), t, device=device, dtype=torch.long)
-
-            # Predict noise
-            pred_epsilon = model(x_lr, zt, t_batch, lr_pos)
-
-            # DDIM update
-            alpha_t = diff_params['sqrt_alphas_cumprod'][t] ** 2
-            alpha_t_prev = (
-                diff_params['sqrt_alphas_cumprod'][timesteps[i+1]] ** 2
-                if i < len(timesteps) - 1
-                else torch.tensor(1.0, dtype=torch.float32, device=device)
-            )
-            sigma_t = ddim_eta * torch.sqrt(
-                (1 - alpha_t_prev) / (1 - alpha_t) * (1 - alpha_t / alpha_t_prev)
-            )
-
-            pred_z0 = (zt - torch.sqrt(1 - alpha_t) * pred_epsilon) / torch.sqrt(alpha_t)
-            dir_zt = torch.sqrt(1 - alpha_t_prev - sigma_t**2) * pred_epsilon
-            noise = torch.randn_like(zt) if i < len(timesteps) - 1 else torch.zeros_like(zt)
-
-            zt = torch.sqrt(alpha_t_prev) * pred_z0 + dir_zt + sigma_t * noise
-
-        z0_pred = zt
-
-        # Decode predicted latent to 256ch SR
-        pred_sr = model.decode_latent_to_sr(z0_pred, x_lr)  # (B, 256, 2080)
-        
-        # Compare with 256ch ground truth SR
-        y_sr = y_sr.to(device)
+        pred_z0 = (zt - sqrt_one_minus * pred_epsilon) / (sqrt_alpha + 1e-8)
+        pred_z0 = torch.clamp(pred_z0, min=-10.0, max=10.0)
+        pred_sr = model.decode_latent_to_sr(pred_z0, x_lr)
 
         all_nmse.append(compute_nmse(pred_sr, y_sr))
         all_pcc.append(compute_pcc(pred_sr, y_sr))
@@ -681,6 +660,8 @@ def train_stad_localizemi(
     persistent_workers=False,
     preprocessed=True,
     loss_weights={'diff': 1.0, 'sr_l2': 0.5},
+    output_dir=None,
+    run_name=None,
 ):
     """
     Train STAD on Localize-MI dataset.
@@ -720,10 +701,18 @@ def train_stad_localizemi(
     """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Keep outputs/checkpoints anchored to this script directory for reliable resume.
-    run_dir = Path(__file__).resolve().parent
-    best_ckpt_path = run_dir / 'best_stad_localizemi.pt'
-    metrics_path = run_dir / 'metrics_history_localizemi.npy'
+    # Keep outputs/checkpoints deterministic and avoid overwrite across folds/modes.
+    if output_dir is None:
+        run_dir = Path(__file__).resolve().parent
+    else:
+        run_dir = Path(output_dir).expanduser().resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    mode_tag = 'prc1' if preprocessed else 'raw'
+    run_tag = run_name if run_name else f'fold{mae_fold}_{mode_tag}'
+
+    best_ckpt_path = run_dir / f'best_stad_localizemi_{run_tag}.pt'
+    metrics_path = run_dir / f'metrics_history_localizemi_{run_tag}.npy'
 
     diff_weight = float(loss_weights.get('diff', 1.0))
     sr_l2_weight = float(loss_weights.get('sr_l2', loss_weights.get('recon_mse', 0.5)))
@@ -1188,7 +1177,16 @@ def train_stad_localizemi(
                 'hr_channels': 128,
                 'sr_channels': 256,
                 'seq_len': 2080,
-                'latent_dim': 1024,
+                'latent_dim': mae_embed_dim,
+                'mae_time_len': mae_time_len,
+                'mae_patch_size': mae_patch_size,
+                'embed_dim': mae_embed_dim,
+                'depth': mae_depth,
+                'num_heads': mae_num_heads,
+                'decoder_embed_dim': mae_decoder_embed_dim,
+                'decoder_depth': mae_decoder_depth,
+                'decoder_num_heads': mae_decoder_num_heads,
+                'mlp_ratio': mae_mlp_ratio,
                 'epoch_duration_ms': 260,
                 'filters': 'highpass_0.1Hz_notch_50_100_150_200Hz',
                 'mae_checkpoint': mae_checkpoint,
@@ -1207,7 +1205,7 @@ def train_stad_localizemi(
             print(f"  Saved best model: {best_ckpt_path.name} (val_loss={val_loss:.6f})")
 
         if (epoch + 1) % 20 == 0:
-            epoch_ckpt_path = run_dir / f'checkpoint_localizemi_epoch_{epoch+1}.pt'
+            epoch_ckpt_path = run_dir / f'checkpoint_localizemi_{run_tag}_epoch_{epoch+1}.pt'
             torch.save(checkpoint, str(epoch_ckpt_path))
             print(f"  Saved checkpoint: {epoch_ckpt_path.name}")
     # ── Final summary ────────────────────────────────────────────────────────────
@@ -1253,6 +1251,10 @@ if __name__ == '__main__':
                         help='Weight for diffusion loss')
     parser.add_argument('--sr_l2_weight', type=float, default=0.5,
                         help='Weight for SR L1 reconstruction loss (SEED4-style objective)')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Directory for checkpoints/metrics (default: script directory)')
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Optional run tag used in checkpoint filenames')
     args = parser.parse_args()
 
     loss_weights = {
@@ -1273,5 +1275,7 @@ if __name__ == '__main__':
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
         preprocessed=(not args.raw_epochs),
-        loss_weights=loss_weights
+        loss_weights=loss_weights,
+        output_dir=args.output_dir,
+        run_name=args.run_name,
     )

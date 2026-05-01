@@ -55,6 +55,34 @@ FREQ_BANDS = {
 }
 
 
+def load_fold_subject_split(mae_results_dir, fold):
+    split_file = Path(mae_results_dir) / "fold_splits.json"
+    if not split_file.exists():
+        raise FileNotFoundError(f"fold_splits.json not found: {split_file}")
+
+    with open(split_file, "r", encoding="utf-8") as f:
+        splits = json.load(f)
+
+    matched = None
+    for item in splits:
+        if int(item.get("fold", -1)) == int(fold):
+            matched = item
+            break
+
+    if matched is None:
+        available = [int(x.get("fold", -1)) for x in splits]
+        raise ValueError(
+            f"Fold {fold} not found in {split_file}. Available folds: {available}"
+        )
+
+    train_subjects = matched.get("train_subjects", [])
+    val_subjects = matched.get("val_subjects", [])
+    if not train_subjects or not val_subjects:
+        raise ValueError(f"Invalid fold split format in {split_file} for fold {fold}")
+
+    return train_subjects, val_subjects
+
+
 def ensure_dir(path):
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -106,6 +134,38 @@ def ddim_generate_sr(model, lr_eeg, device, diff_params, timesteps=1000, ddim_st
         latent = torch.sqrt(alpha_t_prev) * pred_z0 + direction
 
     return model.decode_latent_to_sr(latent, lr_eeg)
+
+
+@torch.no_grad()
+def reconstruct_like_training_validation(model, lr_eeg, sr_gt, device, diff_params, timesteps=1000):
+    """
+    Mirror the training validation path so test metrics are directly comparable.
+
+    This uses the same teacher-forced denoising setup as train_stad_localizemi.py:
+    - encode the ground-truth SR sample to latent
+    - sample a random diffusion timestep
+    - corrupt with Gaussian noise
+    - predict epsilon and reconstruct sr_pred from the denoised latent
+    """
+    model.eval()
+    lr_eeg = lr_eeg.to(device)
+    sr_gt = sr_gt.to(device)
+    batch_size = lr_eeg.size(0)
+
+    z0 = model.encode_sr(sr_gt)
+    z0 = torch.clamp(z0, min=-10.0, max=10.0)
+
+    t = torch.randint(0, timesteps, (batch_size,), device=device)
+    epsilon = torch.randn_like(z0)
+    sqrt_alpha = diff_params["sqrt_alphas_cumprod"][t].view(batch_size, 1, 1)
+    sqrt_one_minus = diff_params["sqrt_one_minus_alphas_cumprod"][t].view(batch_size, 1, 1)
+    zt = sqrt_alpha * z0 + sqrt_one_minus * epsilon
+
+    lr_pos = get_channel_positions(model.lr_channels, device, batch_size)
+    pred_epsilon = model(lr_eeg, zt, t, lr_pos)
+    pred_z0 = (zt - sqrt_one_minus * pred_epsilon) / (sqrt_alpha + 1e-8)
+    pred_z0 = torch.clamp(pred_z0, min=-10.0, max=10.0)
+    return model.decode_latent_to_sr(pred_z0, lr_eeg)
 
 
 def make_montage(n_channels):
@@ -348,7 +408,16 @@ def compute_metrics(pred, target):
     return {"pcc": float(pcc), "nmse": float(nmse), "snr": float(snr), "mae": float(mae)}
 
 
-def evaluate_stad(checkpoint_path, data_path, output_dir, n_samples, preprocessed, metrics_history_path):
+def evaluate_stad(
+    checkpoint_path,
+    data_path,
+    output_dir,
+    n_samples,
+    preprocessed,
+    metrics_history_path,
+    subjects="all",
+    eval_mode="validation_like",
+):
     output_dir = ensure_dir(Path(output_dir))
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -358,10 +427,15 @@ def evaluate_stad(checkpoint_path, data_path, output_dir, n_samples, preprocesse
     print(f"Device: {device}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Data path: {data_path}")
+    print(f"Eval mode: {eval_mode}")
+    if subjects == "all":
+        print("Subjects: all")
+    else:
+        print(f"Subjects ({len(subjects)}): {subjects}")
 
     dataset = LocalizeMISTADDataset(
         data_path,
-        subjects="all",
+        subjects=subjects,
         lr_channels=64,
         hr_channels=128,
         sr_channels=256,
@@ -372,22 +446,48 @@ def evaluate_stad(checkpoint_path, data_path, output_dir, n_samples, preprocesse
     samples, sample_indices = get_samples(dataset, n_samples)
     print(f"Loaded {len(dataset)} available samples; evaluating {len(samples)} of them.")
 
+    # Load checkpoint first to extract model config
+    print("Loading checkpoint to read model config...")
+    checkpoint_raw = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+    cfg = checkpoint_raw.get("config", {})
+    state_dict = checkpoint_raw.get("model", checkpoint_raw)
+    
+    # Infer latent_dim from actual checkpoint weight shape (most reliable)
+    # Check stc.pos_embed shape: [1, 64, 65, latent_dim]
+    if "stc.pos_embed" in state_dict:
+        latent_dim = state_dict["stc.pos_embed"].shape[-1]
+    else:
+        latent_dim = cfg.get("latent_dim", 1024)
+    
+    # Extract model config; fall back to defaults if missing
+    mae_embed_dim = latent_dim  # mae_embed_dim should match inferred latent_dim
+    mae_time_len = cfg.get("mae_time_len", 256)
+    mae_patch_size = cfg.get("mae_patch_size", 16)
+    mae_depth = cfg.get("mae_depth", 12)
+    mae_num_heads = cfg.get("mae_num_heads", 8)
+    mae_decoder_embed_dim = cfg.get("mae_decoder_embed_dim", 256)
+    mae_decoder_depth = cfg.get("mae_decoder_depth", 8)
+    mae_decoder_num_heads = cfg.get("mae_decoder_num_heads", 8)
+    mae_mlp_ratio = cfg.get("mae_mlp_ratio", 2.0)
+    
+    print(f"Model config: latent_dim={latent_dim} (inferred from weights), mae_embed_dim={mae_embed_dim}")
+
     model = STAD_LocalizeMI(
         lr_channels=64,
         hr_channels=128,
         sr_channels=256,
         seq_len=2080,
-        latent_dim=1024,
+        latent_dim=latent_dim,
         n_harmonics=8,
-        mae_time_len=256,
-        mae_patch_size=16,
-        mae_embed_dim=512,
-        mae_depth=12,
-        mae_num_heads=8,
-        mae_decoder_embed_dim=256,
-        mae_decoder_depth=8,
-        mae_decoder_num_heads=8,
-        mae_mlp_ratio=2.0,
+        mae_time_len=mae_time_len,
+        mae_patch_size=mae_patch_size,
+        mae_embed_dim=mae_embed_dim,
+        mae_depth=mae_depth,
+        mae_num_heads=mae_num_heads,
+        mae_decoder_embed_dim=mae_decoder_embed_dim,
+        mae_decoder_depth=mae_decoder_depth,
+        mae_decoder_num_heads=mae_decoder_num_heads,
+        mae_mlp_ratio=mae_mlp_ratio,
     ).to(device)
 
     checkpoint, missing_keys, unexpected_keys = load_checkpoint(model, checkpoint_path, device)
@@ -413,9 +513,24 @@ def evaluate_stad(checkpoint_path, data_path, output_dir, n_samples, preprocesse
         print(f"Evaluating sample {item_idx}/{len(samples)}")
         lr = sample["lr"].unsqueeze(0).to(device)
         hr = sample["hr"].unsqueeze(0).cpu().numpy()[0]
-        sr_gt = sample["sr"].unsqueeze(0).cpu().numpy()[0]
 
-        sr_pred = ddim_generate_sr(model, lr, device, diff_params, timesteps=T, ddim_steps=50)
+        sr_gt_tensor = sample["sr"].unsqueeze(0).to(device)
+        sr_gt = sr_gt_tensor.cpu().numpy()[0]
+
+        if eval_mode == "validation_like":
+            sr_pred = reconstruct_like_training_validation(
+                model,
+                lr,
+                sr_gt_tensor,
+                device,
+                diff_params,
+                timesteps=T,
+            )
+        elif eval_mode == "ddim":
+            sr_pred = ddim_generate_sr(model, lr, device, diff_params, timesteps=T, ddim_steps=50)
+        else:
+            raise ValueError(f"Unsupported eval_mode: {eval_mode}")
+
         sr_pred_np = sr_pred.detach().cpu().numpy()[0]
 
         metrics = compute_metrics(sr_pred_np, sr_gt)
@@ -463,6 +578,7 @@ def evaluate_stad(checkpoint_path, data_path, output_dir, n_samples, preprocesse
     summary = {
         "checkpoint": str(checkpoint_path),
         "data_path": str(data_path),
+        "subjects": subjects,
         "sample_indices": sample_indices,
         "individual_samples": all_metrics,
         "average_metrics": avg_metrics,
@@ -537,12 +653,46 @@ def parse_args():
         default=str(SCRIPT_DIR / "metrics_history_localizemi.npy"),
         help="Optional path to training metrics_history.npy for plotting curves",
     )
+    parser.add_argument(
+        "--mae_results_dir",
+        type=str,
+        default=None,
+        help="Optional MAE k-fold directory containing fold_splits.json",
+    )
+    parser.add_argument(
+        "--mae_fold",
+        type=int,
+        default=None,
+        help="Fold index from fold_splits.json to select subjects from",
+    )
+    parser.add_argument(
+        "--eval_split",
+        type=str,
+        choices=["val", "train"],
+        default="val",
+        help="Which fold split subjects to evaluate when --mae_fold is set",
+    )
+    parser.add_argument(
+        "--eval_mode",
+        type=str,
+        choices=["validation_like", "ddim"],
+        default="validation_like",
+        help="validation_like matches training validation; ddim runs free generation",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     preprocessed = not args.raw_epochs
+
+    subjects = "all"
+    if args.mae_fold is not None:
+        if not args.mae_results_dir:
+            raise ValueError("--mae_results_dir is required when --mae_fold is set")
+        train_subjects, val_subjects = load_fold_subject_split(args.mae_results_dir, args.mae_fold)
+        subjects = val_subjects if args.eval_split == "val" else train_subjects
+
     evaluate_stad(
         checkpoint_path=Path(args.checkpoint),
         data_path=Path(args.data_path),
@@ -550,6 +700,8 @@ def main():
         n_samples=args.n_samples,
         preprocessed=preprocessed,
         metrics_history_path=Path(args.metrics_history),
+        subjects=subjects,
+        eval_mode=args.eval_mode,
     )
 
 

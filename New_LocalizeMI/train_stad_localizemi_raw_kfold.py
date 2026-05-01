@@ -38,6 +38,10 @@ def main():
     parser.add_argument('--persistent_workers', action='store_true')
     parser.add_argument('--diff_weight', type=float, default=1.0)
     parser.add_argument('--sr_l1_weight', type=float, default=0.5)
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Directory for checkpoints/metrics (default: script directory)')
+    parser.add_argument('--run_name', type=str, default='raw_kfold',
+                        help='Run tag used in checkpoint filenames')
     args = parser.parse_args()
 
     loss_weights = {
@@ -59,6 +63,8 @@ def main():
         persistent_workers=args.persistent_workers,
         preprocessed=False,
         loss_weights=loss_weights,
+        output_dir=args.output_dir,
+        run_name=args.run_name,
     )
 
 
