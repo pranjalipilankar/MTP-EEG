@@ -49,7 +49,7 @@ class STADModel(nn.Module):
             n_channels=lr_channels,
             seq_len=1000,
             embed_dim=stc_embed_dim,
-            n_harmonics=8,
+            n_harmonics=32,
             patch_size=8,
             n_transformer_layers=4,
             n_heads=8,
@@ -84,7 +84,6 @@ class STADModel(nn.Module):
         self.sr_to_hr_projection = nn.Conv1d(
             sr_channels, hr_channels, kernel_size=1, bias=False
         )
-        
         # ✅ 5. Channel upsampling: HR (31ch) → SR (62ch) after MAE decoding
         # Following LocalizeMI implementation
         self.hr_to_sr_upsampler = nn.Sequential(

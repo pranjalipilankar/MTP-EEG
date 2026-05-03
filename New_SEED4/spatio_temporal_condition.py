@@ -1,10 +1,5 @@
 """
 Spatio-Temporal Condition Module with Graph Harmonic Innovation
-Based on STAD paper Section III.C.2 + Your graph-based embedding innovation
-
-This module extracts spatio-temporal features from LR EEG to guide the diffusion process.
-YOUR INNOVATION: Using graph harmonic (Laplacian eigenvectors) for spatial embeddings
-instead of simple position embeddings.
 """
 import torch
 import torch.nn as nn
@@ -16,145 +11,126 @@ from scipy.sparse import csgraph
 # Diffusion timestep embedding
 # -------------------------------------------------------------
 def sinusoidal_embedding(timesteps, dim):
-    """Sinusoidal positional encoding for diffusion timesteps"""
     half = dim // 2
     freqs = torch.exp(
         -np.log(10000) * torch.arange(0, half, dtype=torch.float32, device=timesteps.device) / half
     )
     args = timesteps[:, None].float() * freqs[None]
-    emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-    return emb
+    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
-def compute_xy_spatial_embedding(chan_pos, embed_dim=8):
+
+# -------------------------------------------------------------
+# Graph Harmonic Spatial Embeddings
+# -------------------------------------------------------------
+def compute_graph_harmonics(chan_pos, k=32, n_neighbors=6, sigma=None):
     """
-    Simple (x, y) spatial embedding for electrode positions.
-    
     Args:
-        chan_pos: (C, 2) or (B, C, 2) - channel positions, normalized to [-1, 1]
-        embed_dim: output embedding dimension (must be even)
-    
+        chan_pos : (C, 2) channel positions
+        k        : number of eigenvectors to keep
+        n_neighbors: kNN neighbors
+        sigma    : RBF bandwidth; None = median heuristic
     Returns:
-        basis: (C, embed_dim) - spatial embeddings
+        basis: (C, k) normalized graph harmonic basis
     """
     if isinstance(chan_pos, torch.Tensor):
-        chan_pos = chan_pos.detach().cpu().numpy()
-    
-    if chan_pos.ndim == 3:
-        chan_pos = chan_pos[0]  # (C, 2)
+        pos = chan_pos.detach().cpu().numpy()
+    else:
+        pos = chan_pos.copy()
+    if pos.ndim == 3:
+        pos = pos[0]
 
-    C = chan_pos.shape[0]
-    half = embed_dim // 2
+    C = pos.shape[0]
+    k = min(k, C - 2)  # need at least 2 spare
 
-    # Sinusoidal encoding of x and y independently
-    freqs = np.exp(
-        -np.log(10000) * np.arange(0, half, dtype=np.float32) / half
-    )  # (half,)
+    # ── Weighted adjacency (RBF kernel on distances) ──────────────────────────
+    n_nbrs = min(n_neighbors, C - 1)
+    A_dist = kneighbors_graph(pos, n_nbrs, mode='distance',
+                               include_self=False).toarray()
 
-    x = chan_pos[:, 0:1]  # (C, 1)
-    y = chan_pos[:, 1:2]  # (C, 1)
+    # Symmetrise before computing sigma so both directions are counted
+    A_dist = np.maximum(A_dist, A_dist.T)
 
-    x_enc = np.concatenate([np.sin(x * freqs), np.cos(x * freqs)], axis=-1)  # (C, half*2)
-    y_enc = np.concatenate([np.sin(y * freqs), np.cos(y * freqs)], axis=-1)  # (C, half*2)
+    if sigma is None:
+        nonzero = A_dist[A_dist > 0]
+        sigma = np.median(nonzero) if len(nonzero) else 1.0
 
-    basis = x_enc + y_enc  # (C, embed_dim)
+    A_weighted = np.where(A_dist > 0,
+                          np.exp(-A_dist**2 / (2 * sigma**2)),
+                          0.0).astype(np.float32)
 
-    return torch.tensor(basis, dtype=torch.float32)
-# -------------------------------------------------------------
-# Graph Harmonic Spatial Embeddings (YOUR INNOVATION)
-# -------------------------------------------------------------
-def compute_graph_harmonics(chan_pos, k=8, n_neighbors=4):
-    """
-    Compute graph Laplacian eigenvectors for spatial embeddings.
-    
-    YOUR INNOVATION: Instead of standard spatial position embeddings,
-    use spectral graph theory to capture topological structure of electrode layout.
-    
-    Args:
-        chan_pos: (C, 2) or (B, C, 2) - channel positions
-        k: number of eigenvectors (harmonics) to use
-        n_neighbors: number of neighbors for graph construction
-    
-    Returns:
-        basis: (C, k) - graph harmonic basis functions
-    """
-    if isinstance(chan_pos, torch.Tensor):
-        chan_pos = chan_pos.detach().cpu().numpy()
-    
-    # Handle batch dimension
-    if chan_pos.ndim == 3:
-        chan_pos = chan_pos[0]  # Use first sample (positions are same across batch)
-    
-    C = chan_pos.shape[0]
-    
-    # Build k-NN graph from electrode positions
-    A = kneighbors_graph(
-        chan_pos, 
-        n_neighbors=min(n_neighbors, C-1), 
-        mode='connectivity', 
-        include_self=False
-    ).toarray()
-    
-    # Compute normalized graph Laplacian
-    # L = D^(-1/2) * (D - A) * D^(-1/2)
-    L = csgraph.laplacian(A, normed=True)
-    
-    # Eigendecomposition
+    # ── Normalised Laplacian ──────────────────────────────────────────────────
+    L = csgraph.laplacian(A_weighted, normed=True)
+
+    # Small ridge to break degenerate eigenvalues (symmetric electrodes)
+    L += 1e-4 * np.eye(C, dtype=np.float32)
+
     eigenvalues, eigenvectors = np.linalg.eigh(L)
-    
-    # Take first k+1 eigenvectors (skip the constant first one)
-    # These are the "harmonic" basis functions on the electrode graph
-    if k + 1 > C:
-        k = C - 1
-    basis = eigenvectors[:, 1:k+1]  # (C, k)
-    
+
+    # Drop DC component (eigval ≈ 0), keep next k
+    basis = eigenvectors[:, 1:k + 1].astype(np.float32)   # (C, k)
+
+    # L2-normalise each harmonic so scale is consistent across C
+    norms = np.linalg.norm(basis, axis=0, keepdims=True) + 1e-8
+    basis /= norms
+
     return torch.tensor(basis, dtype=torch.float32)
+# -------------------------------------------------------------
+# Simple X, Y Spatial Embedding (alternative, not used)
+# -------------------------------------------------------------
+def compute_xy_spatial_embedding(chan_pos, embed_dim=8):
+    if isinstance(chan_pos, torch.Tensor):
+        chan_pos = chan_pos.detach().cpu().numpy()
+    if chan_pos.ndim == 3:
+        chan_pos = chan_pos[0]
+    half = embed_dim // 2
+    freqs = np.exp(-np.log(10000) * np.arange(0, half, dtype=np.float32) / half)
+    x = chan_pos[:, 0:1]
+    y = chan_pos[:, 1:2]
+    x_enc = np.concatenate([np.sin(x * freqs), np.cos(x * freqs)], axis=-1)
+    y_enc = np.concatenate([np.sin(y * freqs), np.cos(y * freqs)], axis=-1)
+    return torch.tensor(x_enc + y_enc, dtype=torch.float32)
+
 
 # -------------------------------------------------------------
-# 1D Convolution Block for Temporal Feature Extraction
+# Fourier Spatial Embedding (alternative, not used)
+# -------------------------------------------------------------
+def compute_fourier_spatial_embedding(chan_pos, embed_dim=8):
+    if isinstance(chan_pos, torch.Tensor):
+        chan_pos = chan_pos.detach().cpu().numpy()
+    if chan_pos.ndim == 3:
+        chan_pos = chan_pos[0]
+    half = embed_dim // 2
+    np.random.seed(42)
+    W = np.random.randn(2, half).astype(np.float32)
+    proj = chan_pos @ W
+    basis = np.concatenate([np.sin(proj), np.cos(proj)], axis=-1)
+    norms = np.linalg.norm(basis, axis=-1, keepdims=True) + 1e-8
+    return torch.tensor(basis / norms, dtype=torch.float32)
+
+
+# -------------------------------------------------------------
+# 1D Convolution Block
 # -------------------------------------------------------------
 class TemporalConvBlock(nn.Module):
-    """1D convolution for temporal feature extraction (STAD paper)"""
     def __init__(self, in_channels, out_channels, kernel_size=5):
         super().__init__()
-        self.conv = nn.Conv1d(
-            in_channels, out_channels,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2
-        )
+        self.conv = nn.Conv1d(in_channels, out_channels,
+                              kernel_size=kernel_size, padding=kernel_size // 2)
         self.bn = nn.BatchNorm1d(out_channels)
         self.relu = nn.ReLU()
-    
-    def forward(self, x):
-        """
-        Args:
-            x: (B, C, T)
-        Returns:
-            (B, C, T)
-        """
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.relu(x)
-        return x
 
-# -------------------------------------------------------------
-# Spatio-Temporal Condition Module (YOUR VERSION WITH INNOVATION)
-# -------------------------------------------------------------
+    def forward(self, x):
+        return self.relu(self.bn(self.conv(x)))
+
+
 class SpatioTemporalConditionModule(nn.Module):
-    """
-    Extracts spatio-temporal features from LR EEG to condition the diffusion process.
-    
-    Based on STAD paper Section III.C.2:
-    - Temporal processing: 1D CNN + Transformer
-    - Spatial processing: YOUR INNOVATION - Graph harmonic embeddings
-    - Output: Conditioning tokens for cross-attention in diffusion model
-    """
     def __init__(
         self,
-        n_channels=64,        # LR EEG channels
-        seq_len=350,          # Temporal length (350ms as per paper)
-        embed_dim=256,        # Model dimension
-        n_harmonics=8,        # Number of graph harmonics (YOUR PARAMETER)
-        patch_size=16,        # Temporal patch size
+        n_channels=64,
+        seq_len=1000,
+        embed_dim=256,
+        n_harmonics=32,        # ← was 8, needs to be 32 for 62-ch
+        patch_size=8,
         n_transformer_layers=4,
         n_heads=8,
         dropout=0.1,
@@ -166,24 +142,24 @@ class SpatioTemporalConditionModule(nn.Module):
         self.n_harmonics = n_harmonics
         self.patch_size = patch_size
         self.n_patches = seq_len // patch_size
-        
-        self.register_buffer("graph_harmonics", None)  # Will be computed on first forward
-        #1. self.harmonic_proj = nn.Linear(n_harmonics, embed_dim)
-        self.spatial_embed_dim = n_harmonics  # reuse the same param as output dim
-        self.harmonic_proj = nn.Linear(n_harmonics * 2, embed_dim)  # x_enc + y_enc are each n_harmonics
-        # === Temporal Processing (STAD paper) ===
-        # 1D CNN for initial temporal feature extraction
+
+        # ── spatial embedding ──────────────────────────────────────────────
+        # Keyed by C (number of channels) so LR/HR/SR each get correct harmonics.
+        # Plain dict — NOT a register_buffer — because tensors are computed
+        # lazily and may live on different devices.
+        self._harmonic_cache: dict[int, torch.Tensor] = {}
+        actual_harmonics = min(n_harmonics, n_channels - 2)  # mirrors the clip in compute_graph_harmonics
+        self.actual_harmonics = actual_harmonics
+        self.harmonic_proj = nn.Linear(actual_harmonics, embed_dim)
+
+        # Temporal processing
         self.temporal_conv = TemporalConvBlock(n_channels, embed_dim, kernel_size=5)
-        
-        # Patch embedding for temporal patches
         self.patch_embed = nn.Linear(patch_size, embed_dim)
-        
-        # Positional encoding for temporal patches
         self.pos_embed = nn.Parameter(
             torch.randn(1, n_channels, self.n_patches, embed_dim) * 0.02
         )
-        
-        # === Transformer for Spatio-Temporal Integration ===
+
+        # Transformer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=n_heads,
@@ -194,37 +170,24 @@ class SpatioTemporalConditionModule(nn.Module):
             norm_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_transformer_layers)
-        
-        # === Timestep Embedding (Diffusion conditioning) ===
+
+        # Timestep embedding
         self.time_mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.SiLU(),
             nn.Linear(embed_dim * 4, embed_dim)
         )
-        
-        self.norm = nn.LayerNorm(embed_dim)
-    
-    def _compute_harmonics_if_needed(self, chan_pos):
-        if self.graph_harmonics is None:
-            harmonics = compute_xy_spatial_embedding(
-                chan_pos,
-                embed_dim=self.n_harmonics * 2  # sinusoidal of x + sinusoidal of y
-            ).to(chan_pos.device)
-            self.graph_harmonics = harmonics
-        return self.graph_harmonics
 
-    # def _compute_harmonics_if_needed(self, chan_pos):
-    #     """Compute graph harmonics on first forward pass"""
-    #     if self.graph_harmonics is None:
-    #         harmonics = compute_graph_harmonics(
-    #             chan_pos, 
-    #             #k=self.n_harmonics,
-    #             #n_neighbors=4
-    #             embed_dim=self.n_harmonics * 2  # sinusoidal of x + sinusoidal of y
-    #         ).to(chan_pos.device)
-    #         self.graph_harmonics = harmonics
-    #     return self.graph_harmonics
-    
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def _get_harmonics(self, chan_pos):
+        pos = chan_pos[0] if chan_pos.ndim == 3 else chan_pos
+        return compute_graph_harmonics(
+            pos,
+            k=self.actual_harmonics,
+            n_neighbors=min(6, pos.shape[0] - 1)
+        ).to(pos.device)
+
     def forward(self, x, chan_pos, t_steps):
         B, C, T = x.shape
         n_patches = T // self.patch_size
@@ -233,121 +196,36 @@ class SpatioTemporalConditionModule(nn.Module):
         if n_patches != self.n_patches:
             raise ValueError(
                 f"Expected {self.n_patches} temporal patches from seq_len={self.seq_len}, "
-                f"but got {n_patches} patches from input length T={T}."
+                f"but got {n_patches} from T={T}."
             )
         if usable_len != T:
-            # Keep full patches only; avoids shape drift when T is not divisible by patch_size.
             x = x[:, :, :usable_len]
-        
-        # 1) Patch-wise temporal embedding (paper-aligned tokenization by channel and patch)
-        x_patches = x.reshape(B, C, n_patches, self.patch_size)  # (B, C, N, patch_size)
-        temporal_tokens = self.patch_embed(x_patches)  # (B, C, N, embed_dim)
 
-        # 2) Temporal convolution context (local temporal patterns), projected to patch tokens
-        x_conv = self.temporal_conv(x)  # (B, embed_dim, T)
+        # 1) Patch temporal embedding
+        x_patches = x.reshape(B, C, n_patches, self.patch_size)
+        temporal_tokens = self.patch_embed(x_patches)           # (B, C, N, embed_dim)
+
+        # 2) Temporal conv context
+        x_conv = self.temporal_conv(x)                          # (B, embed_dim, T)
         x_conv = x_conv.reshape(B, self.embed_dim, n_patches, self.patch_size).mean(dim=-1)
-        x_conv = x_conv.permute(0, 2, 1).unsqueeze(1).expand(-1, C, -1, -1)  # (B, C, N, embed_dim)
+        x_conv = x_conv.permute(0, 2, 1).unsqueeze(1).expand(-1, C, -1, -1)
 
         temporal_feat = temporal_tokens + x_conv + self.pos_embed
-        
-        # 3. Spatial (unchanged)
-        harmonics = self._compute_harmonics_if_needed(chan_pos)
-        spatial_feat = self.harmonic_proj(harmonics).unsqueeze(0).unsqueeze(2).expand(B, -1, n_patches, -1)
-        
-        # 4. Time embedding (unchanged)
-        t_emb = self.time_mlp(sinusoidal_embedding(t_steps, self.embed_dim)).unsqueeze(1).unsqueeze(2).expand(-1, C, n_patches, -1)
-        
-        # 5. Fusion + Transformer (unchanged)
-        fused_feat = temporal_feat + spatial_feat + t_emb
-        fused_flat = fused_feat.reshape(B, C * n_patches, self.embed_dim)
+
+        # 3) Graph harmonic spatial embedding  ← uses new per-C cache
+        harmonics = self._get_harmonics(chan_pos)               # (C, n_harmonics)
+        spatial_feat = self.harmonic_proj(harmonics)            # (C, embed_dim)
+        spatial_feat = spatial_feat.unsqueeze(0).unsqueeze(2).expand(B, -1, n_patches, -1)
+
+        # 4) Timestep embedding
+        t_emb = self.time_mlp(sinusoidal_embedding(t_steps, self.embed_dim))
+        t_emb = t_emb.unsqueeze(1).unsqueeze(2).expand(-1, C, n_patches, -1)
+
+        # 5) Fuse + Transformer
+        fused = temporal_feat + spatial_feat + t_emb
+        fused_flat = fused.reshape(B, C * n_patches, self.embed_dim)
         cond_flat = self.transformer(fused_flat)
         cond_tokens = self.norm(cond_flat).reshape(B, C, n_patches, self.embed_dim).mean(dim=2)
         cond_pooled = cond_tokens.mean(dim=1)
-        
-        return cond_tokens, cond_pooled
 
-
-
-# -------------------------------------------------------------
-# Lightweight version for faster training (optional)
-# -------------------------------------------------------------
-class LightweightSpatioTemporalConditionModule(nn.Module):
-    """
-    Simplified version with fewer parameters for faster experimentation.
-    Still maintains graph harmonic innovation.
-    """
-    def __init__(
-        self,
-        n_channels=64,
-        seq_len=350,
-        embed_dim=128,
-        n_harmonics=8,
-        n_transformer_layers=2,  # Reduced from 4
-        n_heads=4,               # Reduced from 8
-    ):
-        super().__init__()
-        self.n_channels = n_channels
-        self.embed_dim = embed_dim
-        self.n_harmonics = n_harmonics
-        
-        # Graph harmonics
-        self.register_buffer("graph_harmonics", None)
-        self.harmonic_proj = nn.Linear(n_harmonics, embed_dim)
-        
-        # Simple temporal CNN
-        self.temporal_cnn = nn.Sequential(
-            nn.Conv1d(n_channels, embed_dim, kernel_size=5, padding=2),
-            nn.BatchNorm1d(embed_dim),
-            nn.ReLU(),
-            nn.Conv1d(embed_dim, embed_dim, kernel_size=5, padding=2),
-            nn.BatchNorm1d(embed_dim),
-            nn.ReLU(),
-        )
-        
-        # Simplified transformer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=n_heads,
-            dim_feedforward=2 * embed_dim,  # Reduced
-            dropout=0.1,
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_transformer_layers)
-        
-        # Time embedding
-        self.time_mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 2),
-            nn.SiLU(),
-            nn.Linear(embed_dim * 2, embed_dim)
-        )
-    
-    def forward(self, x, chan_pos, t_steps):
-        """Simplified forward pass"""
-        B, C, T = x.shape
-        
-        # Temporal features
-        temporal_feat = self.temporal_cnn(x)  # (B, embed_dim, T)
-        temporal_feat = temporal_feat.mean(dim=2)  # (B, embed_dim)
-        temporal_feat = temporal_feat.unsqueeze(1).expand(-1, C, -1)  # (B, C, embed_dim)
-        
-        # Spatial features (graph harmonics)
-        if self.graph_harmonics is None:
-            harmonics = compute_graph_harmonics(chan_pos, k=self.n_harmonics)
-            self.graph_harmonics = harmonics.to(x.device)
-        
-        spatial_feat = self.harmonic_proj(self.graph_harmonics)  # (C, embed_dim)
-        spatial_feat = spatial_feat.unsqueeze(0).expand(B, -1, -1)  # (B, C, embed_dim)
-        
-        # Time embedding
-        t_emb = sinusoidal_embedding(t_steps, self.embed_dim)
-        t_emb = self.time_mlp(t_emb).unsqueeze(1).expand(-1, C, -1)  # (B, C, embed_dim)
-        
-        # Fusion
-        fused = temporal_feat + spatial_feat + t_emb
-        
-        # Transformer
-        cond_tokens = self.transformer(fused)
-        cond_pooled = cond_tokens.mean(dim=1)
-        
         return cond_tokens, cond_pooled
