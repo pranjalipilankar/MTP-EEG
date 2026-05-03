@@ -246,12 +246,12 @@ def save_loss_curves_plot(diff_losses, sr_losses, out_path):
         axes[0].text(0.5, 0.5, 'No diffusion loss (sampling mode)', ha='center', va='center',
                     transform=axes[0].transAxes, fontsize=12, color='gray')
     
-    # SR L1 loss
-    axes[1].plot(sr_losses, linewidth=1.5, color='coral', label='SR L1 Loss')
+    # SR L2 (MSE) loss
+    axes[1].plot(sr_losses, linewidth=1.5, color='coral', label='SR L2 Loss')
     axes[1].fill_between(range(len(sr_losses)), sr_losses, alpha=0.3, color='coral')
     axes[1].set_ylabel('Loss')
     axes[1].set_xlabel('Batch')
-    axes[1].set_title('SR L1 Loss Over Batches')
+    axes[1].set_title('SR L2 (MSE) Loss Over Batches')
     axes[1].grid(alpha=0.3)
     axes[1].legend()
     
@@ -813,7 +813,8 @@ def evaluate(args):
             else:
                 diff_loss, pred_sr = model(lr_eeg, hr_eeg, sr_eeg)
 
-            sr_loss = F.l1_loss(pred_sr.float(), sr_eeg.float())
+            # Use L2 / MSE for SR loss (instead of L1)
+            sr_loss = F.mse_loss(pred_sr.float(), sr_eeg.float())
             metrics = compute_sr_metrics(pred_sr.float(), sr_eeg.float())
 
             saved_pred_sr.append(pred_sr.detach().cpu().numpy())
@@ -858,7 +859,7 @@ def evaluate(args):
     print('=' * 80)
     print(f"Samples tested: {len(sr_losses) * args.batch_size} (approx)")
     print(f"Diff Loss: {mean_diff:.6f}")
-    print(f"SR L1 Loss: {mean_sr:.6f}")
+    print(f"SR L2 Loss (MSE): {mean_sr:.6f}")
     print(f"PCC: {mean_pcc:.4f}")
     print(f"NMSE: {mean_nmse:.4f}")
     print(f"SNR: {mean_snr:.2f} dB")
