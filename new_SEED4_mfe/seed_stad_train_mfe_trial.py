@@ -6,8 +6,9 @@ Using MFE (Multiscale Fuzzy Entropy) Profile Loss for complexity preservation.
 Features:
 - Differentiable Multiscale Fuzzy Entropy loss
 - Z-score normalization for robust entropy calculation (Handled internally)
-- Combined loss: diffusion + L1 (Baseline) + MFE
-- Default weights: SR=0.1, MFE=0.1 (tunable)
+- Combined loss: diffusion + L2 (MSE) + MFE
+- MFE computed on CPU (every 4th channel) to avoid GPU OOM
+- Default weights: SR=1.0, MFE=0.05 (tunable)
 """
 import os
 import sys
@@ -215,25 +216,63 @@ def resolve_mae_checkpoint(mae_checkpoint, mae_kfold_dir, mae_fold):
 # =========================================================================
 
 def build_mfe_loss(m=2, n=2.0, tau_max=20, normalize_z=True, r_fixed=0.15, device=None):
-    loss_fn = MFEProfileLoss(m=m, n=n, tau_max=tau_max, normalize_z=normalize_z, 
+    # Always build on CPU — MFE is computed on CPU to avoid GPU OOM
+    loss_fn = MFEProfileLoss(m=m, n=n, tau_max=tau_max, normalize_z=normalize_z,
                              r_fixed=r_fixed, distance='mse', reduction='mean')
-    if device is not None:
-        loss_fn = loss_fn.to(device)
-    print(f"\n📊 MFE Config: m={m}, n={n}, tau_max={tau_max}, r={r_fixed}")
+    print(f"\n📊 MFE Config: m={m}, n={n}, tau_max={tau_max}, r={r_fixed} [computed on CPU]")
     return loss_fn
+
+# =========================================================================
+# MFE helper — CPU-offloaded, every 4th channel
+# =========================================================================
+
+def compute_mfe_loss_cpu(mfe_loss_fn, pred, target, device):
+    """
+    Compute MFE loss on CPU using every 4th channel (16 out of 62).
+    pred / target: GPU tensors (B, C, T)
+    Returns a scalar tensor on `device`.
+    """
+    mfe_channels = list(range(0, pred.shape[1], 4))  # [0, 4, 8, ..., 60] → 16 channels
+    pred_cpu   = pred.detach().cpu().float()
+    target_cpu = target.detach().cpu().float()
+
+    mfe_loss = torch.tensor(0.0, dtype=torch.float32)
+    for ch in mfe_channels:
+        mfe_loss = mfe_loss + mfe_loss_fn(
+            pred_cpu[:, ch:ch+1, :],
+            target_cpu[:, ch:ch+1, :]
+        )
+    mfe_loss = mfe_loss / len(mfe_channels)
+    torch.cuda.empty_cache()
+    return mfe_loss.to(device)
+
+# =========================================================================
+# MFE weight schedule
+# =========================================================================
+
+def get_mfe_weight(epoch, mfe_loss_weight):
+    if epoch < 20:
+        return 0.0
+    elif epoch < 50:
+        return mfe_loss_weight * (epoch - 20) / 30
+    else:
+        return mfe_loss_weight
 
 # =========================================================================
 # Training loop
 # =========================================================================
 
 def train_stad_model(stad_model, train_loader, val_loader, args, device, output_dir):
-    mfe_loss_fn = build_mfe_loss(m=args.mfe_m, n=args.mfe_n, tau_max=args.mfe_tau_max,
-                                 normalize_z=True, r_fixed=args.mfe_r_fixed, device=device)
-    
+    # MFE loss fn lives on CPU — no .to(device)
+    mfe_loss_fn = build_mfe_loss(
+        m=args.mfe_m, n=args.mfe_n, tau_max=args.mfe_tau_max,
+        normalize_z=True, r_fixed=args.mfe_r_fixed, device=None
+    )
+
     trainable_params = [p for p in stad_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
-    
+
     best_val_loss = float('inf')
     history = []
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
@@ -243,11 +282,9 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
     if args.resume_stad_checkpoint and os.path.exists(args.resume_stad_checkpoint):
         print(f"\n🔁 Resuming from checkpoint: {args.resume_stad_checkpoint}")
         checkpoint = torch.load(args.resume_stad_checkpoint, map_location=device)
-
         stad_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         start_epoch = checkpoint.get('epoch', 0)
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-
         if args.resume_optimizer:
             if 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -255,22 +292,24 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             if 'scaler_state_dict' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
-
         print(f"✅ Resumed from epoch {start_epoch}")
 
     for epoch in range(start_epoch, args.epochs):
-        if (args.freeze_mae and not mae_unfrozen and args.unfreeze_mae_epoch >= 0 
-            and epoch >= args.unfreeze_mae_epoch):
+        if (args.freeze_mae and not mae_unfrozen and args.unfreeze_mae_epoch >= 0
+                and epoch >= args.unfreeze_mae_epoch):
             for param in stad_model.mae_encoder.parameters():
                 param.requires_grad = True
             mae_unfrozen = True
             print(f"\n🔓 Unfroze MAE at epoch {epoch + 1}")
 
+        mfe_weight = get_mfe_weight(epoch, args.mfe_loss_weight)
+
+        # ------------------------------------------------------------------
         # TRAIN
+        # ------------------------------------------------------------------
         stad_model.train()
-        # CHANGED: 'mse' changed to 'sr' for consistency
         train_losses = {'total': [], 'diff': [], 'sr': [], 'mfe': []}
-        
+
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs} [train]"):
             lr_eeg = batch['lr'].to(device)
             hr_eeg = batch['hr'].to(device)
@@ -280,45 +319,18 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
             if device.type == 'cuda':
                 with torch.amp.autocast('cuda'):
                     diff_loss, pred_sr = stad_model(lr_eeg, hr_eeg, sr_eeg)
-                    
-                    # CHANGED: Baseline is L1
                     sr_loss = F.mse_loss(pred_sr.float(), sr_eeg.float())
-                    
-                    # CHANGED: Removed manual Z-score; MFE handles it
-                    mfe_loss = 0
-                    for ch in range(pred_sr.shape[1]):
-                        mfe_loss += mfe_loss_fn(
-                            pred_sr[:, ch:ch+1, :],
-                            sr_eeg[:, ch:ch+1, :].detach()
-                        )
-                    mfe_loss /= pred_sr.shape[1]
-                    if epoch < 20:
-                        mfe_weight = 0.0
-                    elif epoch < 50:
-                        mfe_weight = args.mfe_loss_weight * (epoch - 20) / 30
-                    else:
-                        mfe_weight = args.mfe_loss_weight
-                    mfe_loss = torch.clamp(mfe_loss, 0, 5.0)
-                    total_loss = diff_loss + args.sr_loss_weight * sr_loss + mfe_weight * mfe_loss
+
+                # MFE outside autocast — runs on CPU
+                mfe_loss = compute_mfe_loss_cpu(mfe_loss_fn, pred_sr, sr_eeg, device)
+                mfe_loss = torch.clamp(mfe_loss, 0, 5.0)
+
+                total_loss = diff_loss + args.sr_loss_weight * sr_loss + mfe_weight * mfe_loss
             else:
                 diff_loss, pred_sr = stad_model(lr_eeg, hr_eeg, sr_eeg)
                 sr_loss = F.mse_loss(pred_sr.float(), sr_eeg.float())
-                mfe_loss = 0
-                for ch in range(pred_sr.shape[1]):
-                    mfe_loss += mfe_loss_fn(
-                        pred_sr[:, ch:ch+1, :],
-                        sr_eeg[:, ch:ch+1, :].detach()
-                    )
-                mfe_loss /= pred_sr.shape[1]
-                if epoch < 20:
-                    mfe_weight = 0.0
-                elif epoch < 50:
-                    mfe_weight = args.mfe_loss_weight * (epoch - 20) / 30
-                else:
-                    mfe_weight = args.mfe_loss_weight
-
+                mfe_loss = compute_mfe_loss_cpu(mfe_loss_fn, pred_sr, sr_eeg, device)
                 mfe_loss = torch.clamp(mfe_loss, 0, 5.0)
-
                 total_loss = diff_loss + args.sr_loss_weight * sr_loss + mfe_weight * mfe_loss
 
             if not torch.isfinite(total_loss):
@@ -327,20 +339,22 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
 
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_([p for p in stad_model.parameters() if p.requires_grad], max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in stad_model.parameters() if p.requires_grad], max_norm=1.0
+            )
             scaler.step(optimizer)
             scaler.update()
 
             train_losses['total'].append(total_loss.item())
             train_losses['diff'].append(diff_loss.item())
-            # CHANGED: Key is 'sr', appends sr_loss
             train_losses['sr'].append(sr_loss.item())
             train_losses['mfe'].append(mfe_loss.item())
 
+        # ------------------------------------------------------------------
         # VALIDATE
+        # ------------------------------------------------------------------
         stad_model.eval()
-        # CHANGED: 'mse' changed to 'sr' for consistency
-        val_losses = {'total': [], 'diff': [], 'sr': [], 'mfe': []}
+        val_losses  = {'total': [], 'diff': [], 'sr': [], 'mfe': []}
         val_metrics = {'pcc': [], 'nmse': [], 'snr': []}
 
         with torch.no_grad():
@@ -352,39 +366,18 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
                 if device.type == 'cuda':
                     with torch.amp.autocast('cuda'):
                         vd_loss, vpred_sr = stad_model(lr_eeg, hr_eeg, sr_eeg)
-                        
-                        # CHANGED: Use L1 and vsr_loss naming
                         vsr_loss = F.mse_loss(vpred_sr.float(), sr_eeg.float())
-                        vh_loss = 0
-                        for ch in range(vpred_sr.shape[1]):
-                            vh_loss += mfe_loss_fn(
-                                vpred_sr[:, ch:ch+1, :],
-                                sr_eeg[:, ch:ch+1, :].detach()
-                            )
-                        vh_loss /= vpred_sr.shape[1]
-                        if epoch < 20:
-                            mfe_weight = 0.0
-                        elif epoch < 50:
-                            mfe_weight = args.mfe_loss_weight * (epoch - 20) / 30
-                        else:
-                            mfe_weight = args.mfe_loss_weight
-                        vt_loss = vd_loss + args.sr_loss_weight * vsr_loss + mfe_weight * vh_loss
+
+                    # MFE outside autocast — runs on CPU
+                    vh_loss = compute_mfe_loss_cpu(mfe_loss_fn, vpred_sr, sr_eeg, device)
+                    vh_loss = torch.clamp(vh_loss, 0, 5.0)
+
+                    vt_loss = vd_loss + args.sr_loss_weight * vsr_loss + mfe_weight * vh_loss
                 else:
                     vd_loss, vpred_sr = stad_model(lr_eeg, hr_eeg, sr_eeg)
                     vsr_loss = F.mse_loss(vpred_sr.float(), sr_eeg.float())
-                    vh_loss = 0
-                    for ch in range(vpred_sr.shape[1]):
-                        vh_loss += mfe_loss_fn(
-                            vpred_sr[:, ch:ch+1, :],
-                            sr_eeg[:, ch:ch+1, :].detach()
-                        )
-                    vh_loss /= vpred_sr.shape[1]
-                    if epoch < 20:
-                        mfe_weight = 0.0
-                    elif epoch < 50:
-                        mfe_weight = args.mfe_loss_weight * (epoch - 20) / 30
-                    else:
-                        mfe_weight = args.mfe_loss_weight
+                    vh_loss = compute_mfe_loss_cpu(mfe_loss_fn, vpred_sr, sr_eeg, device)
+                    vh_loss = torch.clamp(vh_loss, 0, 5.0)
                     vt_loss = vd_loss + args.sr_loss_weight * vsr_loss + mfe_weight * vh_loss
 
                 if not torch.isfinite(vt_loss):
@@ -393,32 +386,35 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
                 metrics = compute_sr_metrics(vpred_sr.float(), sr_eeg.float())
                 val_losses['total'].append(vt_loss.item())
                 val_losses['diff'].append(vd_loss.item())
-                # CHANGED: Append vsr_loss
                 val_losses['sr'].append(vsr_loss.item())
                 val_losses['mfe'].append(vh_loss.item())
                 val_metrics['pcc'].append(metrics['pcc'])
                 val_metrics['nmse'].append(metrics['nmse'])
                 val_metrics['snr'].append(metrics['snr'])
 
-        # Aggregate metrics
+        # ------------------------------------------------------------------
+        # Aggregate & log
+        # ------------------------------------------------------------------
         def _mean(lst):
             return float(np.mean(lst)) if lst else float('inf')
 
         train_loss = _mean(train_losses['total'])
-        val_loss = _mean(val_losses['total'])
-        mean_pcc = _mean(val_metrics['pcc']) if val_metrics['pcc'] else 0.0
-        mean_nmse = _mean(val_metrics['nmse'])
-        mean_snr = _mean(val_metrics['snr'])
+        val_loss   = _mean(val_losses['total'])
+        mean_pcc   = _mean(val_metrics['pcc']) if val_metrics['pcc'] else 0.0
+        mean_nmse  = _mean(val_metrics['nmse'])
+        mean_snr   = _mean(val_metrics['snr'])
 
         scheduler.step()
 
         print(
             f"Epoch {epoch + 1}/{args.epochs} | "
-            f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
+            f"Train: {train_loss:.6f} (diff={_mean(train_losses['diff']):.4f}, "
+            f"sr={_mean(train_losses['sr']):.4f}, mfe={_mean(train_losses['mfe']):.4f}) | "
+            f"Val: {val_loss:.6f} | "
             f"PCC: {mean_pcc:.4f}, NMSE: {mean_nmse:.4f}, SNR: {mean_snr:.2f}dB"
         )
 
-        # Save checkpoint
+        # Save best checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_path = output_dir / 'best_stad_model.pth'
@@ -432,7 +428,7 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
             }, save_path)
             print(f"  ✅ Saved best model → {save_path}")
 
-        # ALWAYS save last checkpoint (for resume)
+        # Always save last checkpoint (for resume)
         last_ckpt_path = output_dir / 'last_checkpoint.pth'
         torch.save({
             'epoch': epoch + 1,
@@ -446,10 +442,13 @@ def train_stad_model(stad_model, train_loader, val_loader, args, device, output_
         history.append({
             'epoch': epoch + 1,
             'train_loss': train_loss,
-            'val_loss': val_loss,
-            'val_pcc': mean_pcc,
-            'val_nmse': mean_nmse,
-            'val_snr': mean_snr,
+            'train_diff': _mean(train_losses['diff']),
+            'train_sr':   _mean(train_losses['sr']),
+            'train_mfe':  _mean(train_losses['mfe']),
+            'val_loss':   val_loss,
+            'val_pcc':    mean_pcc,
+            'val_nmse':   mean_nmse,
+            'val_snr':    mean_snr,
         })
 
     # Save history
@@ -468,12 +467,12 @@ def create_split(data_path, n_folds=5, test_fold=0):
     splits = list(kf.split(all_subjects))
     train_val_idx, test_idx = splits[test_fold]
     val_size = len(train_val_idx) // 5
-    val_idx = train_val_idx[:val_size]
+    val_idx  = train_val_idx[:val_size]
     train_idx = train_val_idx[val_size:]
     return {
         'train': [all_subjects[i] for i in train_idx],
-        'val': [all_subjects[i] for i in val_idx],
-        'test': [all_subjects[i] for i in test_idx],
+        'val':   [all_subjects[i] for i in val_idx],
+        'test':  [all_subjects[i] for i in test_idx],
     }
 
 # =========================================================================
@@ -481,32 +480,32 @@ def create_split(data_path, n_folds=5, test_fold=0):
 # =========================================================================
 
 def main():
-    parser = argparse.ArgumentParser('SEED-IV STAD Training — Baseline L1 + MFE Loss')
-    parser.add_argument('--mae_checkpoint', type=str, default='best_model.pth')
-    parser.add_argument('--mae_kfold_dir', type=str,
-                       default='/home/ab_students/EEG-MTP/trial_mae_SEED4/results_31ch_kfold_fixed')
-    parser.add_argument('--mae_fold', type=int, default=None)
-    parser.add_argument('--freeze_mae', action='store_true')
-    parser.add_argument('--data_path', type=str, default='/DATA/EEG-MTP/seed4/eeg_processed_data')
-    parser.add_argument('--test_fold', type=int, default=0)
-    parser.add_argument('--raw_data', action='store_true')
-    parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=0.05)
-    parser.add_argument('--min_lr', type=float, default=1e-6)
-    parser.add_argument('--sr_loss_weight', type=float, default=1)
+    parser = argparse.ArgumentParser('SEED-IV STAD Training — L2 (MSE) + MFE Loss')
+    parser.add_argument('--mae_checkpoint',  type=str, default='best_model.pth')
+    parser.add_argument('--mae_kfold_dir',   type=str,
+                        default='/home/ab_students/EEG-MTP/trial_mae_SEED4/results_31ch_kfold_fixed')
+    parser.add_argument('--mae_fold',        type=int, default=None)
+    parser.add_argument('--freeze_mae',      action='store_true')
+    parser.add_argument('--data_path',       type=str, default='/DATA/EEG-MTP/seed4/eeg_processed_data')
+    parser.add_argument('--test_fold',       type=int, default=0)
+    parser.add_argument('--raw_data',        action='store_true')
+    parser.add_argument('--epochs',          type=int,   default=300)
+    parser.add_argument('--batch_size',      type=int,   default=8)
+    parser.add_argument('--lr',              type=float, default=1e-4)
+    parser.add_argument('--weight_decay',    type=float, default=0.05)
+    parser.add_argument('--min_lr',          type=float, default=1e-6)
+    parser.add_argument('--sr_loss_weight',  type=float, default=1.0)
     parser.add_argument('--mfe_loss_weight', type=float, default=0.05)
-    parser.add_argument('--mfe_m', type=int, default=2)
-    parser.add_argument('--mfe_n', type=float, default=2.0)
-    parser.add_argument('--mfe_tau_max', type=int, default=5)
-    parser.add_argument('--mfe_r_fixed', type=float, default=0.15)
+    parser.add_argument('--mfe_m',           type=int,   default=2)
+    parser.add_argument('--mfe_n',           type=float, default=2.0)
+    parser.add_argument('--mfe_tau_max',     type=int,   default=5)
+    parser.add_argument('--mfe_r_fixed',     type=float, default=0.15)
     parser.add_argument('--diffusion_schedule', type=str, default='cosine')
     parser.add_argument('--unfreeze_mae_epoch', type=int, default=50)
     parser.add_argument('--mae_finetune_lr', type=float, default=2e-5)
-    parser.add_argument('--output_dir', type=str, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--test_only', action='store_true')
+    parser.add_argument('--output_dir',      type=str, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument('--device',          type=str, default='cuda')
+    parser.add_argument('--test_only',       action='store_true')
     parser.add_argument('--resume_stad_checkpoint', type=str, default='')
     parser.add_argument('--resume_optimizer', action='store_true')
 
@@ -528,12 +527,12 @@ def main():
     # Datasets
     print("\nCreating datasets...")
     train_dataset = SEED4STADDataset(args.data_path, splits['train'], raw_data=args.raw_data)
-    val_dataset = SEED4STADDataset(args.data_path, splits['val'], raw_data=args.raw_data)
-    test_dataset = SEED4STADDataset(args.data_path, splits['test'], raw_data=args.raw_data)
+    val_dataset   = SEED4STADDataset(args.data_path, splits['val'],   raw_data=args.raw_data)
+    test_dataset  = SEED4STADDataset(args.data_path, splits['test'],  raw_data=args.raw_data)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,  num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader  = DataLoader(test_dataset,  batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     print(f"  Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
 
@@ -544,7 +543,9 @@ def main():
         print(f"\n❌ {e}")
         return
 
-    mae_model, mae_config = load_mae_from_kfold(checkpoint_path, device=device, freeze_encoder=args.freeze_mae)
+    mae_model, mae_config = load_mae_from_kfold(
+        checkpoint_path, device=device, freeze_encoder=args.freeze_mae
+    )
 
     # STAD
     print("\n" + "="*80)
@@ -559,9 +560,14 @@ def main():
     print(f"✓ Latent shape: {latents.shape}")
 
     stad_model = STADModel(
-        mae_encoder=mae_model, lr_channels=16, hr_channels=mae_config['in_chans'],
-        sr_channels=62, latent_dim=mae_config['embed_dim'], num_patches=latents.shape[1],
-        diffusion_schedule=args.diffusion_schedule, lr_channel_indices=train_dataset.lr_indices,
+        mae_encoder=mae_model,
+        lr_channels=16,
+        hr_channels=mae_config['in_chans'],
+        sr_channels=62,
+        latent_dim=mae_config['embed_dim'],
+        num_patches=latents.shape[1],
+        diffusion_schedule=args.diffusion_schedule,
+        lr_channel_indices=train_dataset.lr_indices,
         device=device,
     )
     stad_model = stad_model.to(device)
@@ -574,14 +580,18 @@ def main():
     print("\n" + "="*80)
     print("Training Configuration")
     print("="*80)
-    print(f"  Output: {output_dir}")
-    print(f"  Epochs: {args.epochs}, Batch: {args.batch_size}, LR: {args.lr}")
-    print(f"  Loss = diffusion + {args.sr_loss_weight} * L1 + {args.mfe_loss_weight} * MFE")
+    print(f"  Output:       {output_dir}")
+    print(f"  Epochs:       {args.epochs}  |  Batch: {args.batch_size}  |  LR: {args.lr}")
+    print(f"  Loss = diffusion + {args.sr_loss_weight} * L2(MSE) + {args.mfe_loss_weight} * MFE")
+    print(f"  MFE: CPU-offloaded, every 4th channel ({len(list(range(0, 62, 4)))} / 62 channels)")
+    print(f"  MFE warm-up: 0 weight for epochs 0-19, ramp up epochs 20-49, full from epoch 50")
+    print("="*80)
 
     print("\n" + "="*80)
-    print("Training STAD (diffusion + L1 + MFE)")
+    print("Training STAD (diffusion + L2 + MFE)")
     print("="*80)
     train_stad_model(stad_model, train_loader, val_loader, args, device, output_dir)
+
     print("\n✅ Training finished.")
     print(f"   Results saved in: {output_dir}")
 
